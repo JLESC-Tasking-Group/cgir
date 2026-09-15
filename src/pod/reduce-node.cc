@@ -55,11 +55,11 @@ command_graph_t::pass_reduce_node(void)
         # if 0
         if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
         {
-            if (u->command->type == COMMAND_TYPE_BATCH && u->command->batch)
+            if (u->command->type == COMMAND_TYPE_PACK && u->command->pack)
             {
-                if (u->command->batch->has_cg)
+                if (u->command->pack->has_cg)
                 {
-                    u->command->batch->cg.pass_reduction_node();
+                    u->command->pack->cg.pass_reduction_node();
                 }
             }
         }

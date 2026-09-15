@@ -7,8 +7,8 @@ project(tests)
 
 # list of tests
 set(TEST_SOURCES
-    batch.cc
-    batch-random.cc
+    pack.cc
+    pack-random.cc
     sequence.cc
     h2d-distribute.cc
 )

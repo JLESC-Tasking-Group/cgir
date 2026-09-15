@@ -73,11 +73,11 @@ command_graph_t::pass_transitive_reduction(void)
         if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND)
         {
             assert(u->command);
-            if (u->command->type == COMMAND_TYPE_BATCH && u->command->batch)
+            if (u->command->type == COMMAND_TYPE_PACK && u->command->pack)
             {
-                if (u->command->batch->has_cg)
+                if (u->command->pack->has_cg)
                 {
-                    u->command->batch->cg.pass_reduction_edge();
+                    u->command->pack->cg.pass_reduction_edge();
                 }
             }
         }

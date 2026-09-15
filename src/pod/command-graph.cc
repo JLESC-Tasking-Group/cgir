@@ -47,7 +47,7 @@
 CGIR_NAMESPACE_USE;
 
 /* Process-wide, so that a walk id is unique across every graph that can reach
- * a given node -- a sub-graph built by `sequence` or `batch` shares its nodes
+ * a given node -- a sub-graph built by `sequence` or `pack` shares its nodes
  * with its parent. Bumped once per walk, so the atomic is never contended by
  * the traversal itself. See command_graph_walk_id_t. */
 std::atomic<CGIR_NAMESPACE::command_graph_walk_id_t>
@@ -85,13 +85,13 @@ command_graph_dump_interior(
             case (COMMAND_GRAPH_NODE_TYPE_COMMAND):
             {
                 assert(node->command);
-                if (node->command->type == COMMAND_TYPE_BATCH && node->command->batch.cg)
+                if (node->command->type == COMMAND_TYPE_PACK && node->command->pack.cg)
                 {
                     fprintf(f, "  subgraph cluster_%p {\n", node);
                     fprintf(f, "    \"%p\" [style=invis, width=0, height=0, label=\"\"] ;\n", node);
                     fprintf(f, "    label=\"node %lu\\ndev=%u\\ncmd=%s\" ;\n",
                             node->iterator_index, node->device_unique_id, command_type_to_str(node->command->type));
-                    command_graph_dump_interior(node->command->batch.cg, f);
+                    command_graph_dump_interior(node->command->pack.cg, f);
                     fprintf(f, "  }\n");
                 }
                 else
@@ -112,9 +112,9 @@ command_graph_dump_interior(
         node->foreach_successor([&] (command_graph_node_t * succ)
         {
             fprintf(f, "  \"%p\" -> \"%p\"", node, succ);
-            if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && node->command->type == COMMAND_TYPE_BATCH)
+            if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && node->command->type == COMMAND_TYPE_PACK)
                 fprintf(f, " [ltail=cluster_%p]", node);
-            if (succ->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && succ->command->type == COMMAND_TYPE_BATCH)
+            if (succ->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && succ->command->type == COMMAND_TYPE_PACK)
                 fprintf(f, " [lhead=cluster_%p]", succ);
             fprintf(f, " ;\n");
         });

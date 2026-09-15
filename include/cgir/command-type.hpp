@@ -41,7 +41,7 @@
 CGIR_NAMESPACE_BEGIN
 
 /* Macro to iterate through all command type */
-# define CGIR_FORALL_COMMAND_TYPE(F)                                                 \
+# define CGIR_FORALL_COMMAND_TYPE(F)                                                \
     F(COMMAND_TYPE_PROG,            command_prog_t,             "PROG")             \
     F(COMMAND_TYPE_COPY_H2H_1D,     command_copy_1D_t,          "COPY-1D-H2H")      \
     F(COMMAND_TYPE_COPY_H2D_1D,     command_copy_1D_t,          "COPY-1D-H2D")      \
@@ -53,7 +53,7 @@ CGIR_NAMESPACE_BEGIN
     F(COMMAND_TYPE_COPY_D2D_2D,     command_copy_2D_t,          "COPY-2D-D2D")      \
     F(COMMAND_TYPE_FD_READ,         command_file_t,             "FD-READ")          \
     F(COMMAND_TYPE_FD_WRITE,        command_file_t,             "FD-WRITE")         \
-    F(COMMAND_TYPE_BATCH,           command_batch_t,            "BATCH")            \
+    F(COMMAND_TYPE_PACK,            command_batch_t,             "PACK")            \
     F(COMMAND_TYPE_CTRL_LOOP,       command_ctrl_loop_t,        "CTRL-LOOP")        \
     F(COMMAND_TYPE_CTRL_DEMUX,      command_ctrl_demux_t,       "CTRL-DEMUX")
 
