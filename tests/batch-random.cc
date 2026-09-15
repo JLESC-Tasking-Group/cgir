@@ -35,11 +35,11 @@
 **/
 
 /*
- * BATCH PASS - randomized invariant harness.
+ * PACK PASS - randomized invariant harness.
  *
- * Generates random command graphs, runs the batch (packing) pass on each, and
+ * Generates random command graphs, runs the pack (packing) pass on each, and
  * checks the invariants the pass must satisfy on every input. See the header of
- * src/pod/batch.cc for the algorithm; the properties checked here are:
+ * src/pod/pack.cc for the algorithm; the properties checked here are:
  *
  *   monochromatic  every packed island holds commands of a single device;
  *   admissible     every external predecessor of an island precedes all of its
@@ -57,7 +57,7 @@
  * run on small graphs. They measure heuristic *quality*, not correctness, so
  * they are reported and never asserted.
  *
- * Usage: batch-random [ngraphs] [min_nodes] [max_nodes] [seed]
+ * Usage: pack-random [ngraphs] [min_nodes] [max_nodes] [seed]
  */
 
 # include <stdint.h>
@@ -297,11 +297,11 @@ collect_result(command_graph_t * cg, const snapshot_t & snap, result_t & r)
     cg->walk([&](command_graph_node_t * u)
     {
         if (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND &&
-            u->command && u->command->type == COMMAND_TYPE_BATCH)
+            u->command && u->command->type == COMMAND_TYPE_PACK)
         {
-            assert(u->command->batch.cg);
+            assert(u->command->pack.cg);
             std::vector<int> members;
-            collect_members(u->command->batch.cg, snap, members);
+            collect_members(u->command->pack.cg, snap, members);
             const int id = (int) r.island.size();
             for (int m : members) r.owner[m] = id;
             r.island.push_back(members);
@@ -500,7 +500,7 @@ main(int argc, char ** argv)
         return 2;
     }
 
-    fprintf(stdout, "batch-random: %ld graphs, %d-%d commands, base seed %llu\n",
+    fprintf(stdout, "pack-random: %ld graphs, %d-%d commands, base seed %llu\n",
             ngraphs, min_nodes, max_nodes, (unsigned long long) base);
 
     stats_t st;
@@ -529,7 +529,7 @@ main(int argc, char ** argv)
         std::vector<int> cmd_idx;
         for (command_graph_node_t * c : cmds) cmd_idx.push_back(snap.index.at(c));
 
-        cg->optimize(COMMAND_GRAPH_PASS_BATCH);
+        cg->optimize(COMMAND_GRAPH_PASS_PACK);
 
         rc |= check_one(cg, snap, cmds, seed, st);
         if (rc) break;
@@ -565,7 +565,7 @@ main(int argc, char ** argv)
 
     if (rc)
     {
-        fprintf(stderr, "batch-random: FAILED\n");
+        fprintf(stderr, "pack-random: FAILED\n");
         return rc;
     }
 
@@ -593,6 +593,6 @@ main(int argc, char ** argv)
         fprintf(stdout, "  vs exhaustive optimum : skipped (graphs above %d commands)\n",
                 EXHAUSTIVE_MAX_NODES);
 
-    fprintf(stdout, "PASS [batch-random]: all invariants hold on %ld graphs\n", st.graphs);
+    fprintf(stdout, "PASS [pack-random]: all invariants hold on %ld graphs\n", st.graphs);
     return 0;
 }

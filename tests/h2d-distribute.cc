@@ -94,7 +94,7 @@ main(void)
     cg->optimize(
           COMMAND_GRAPH_PASS_REDUCE_NODE_BIT
         | COMMAND_GRAPH_PASS_TRANSITIVE_REDUCTION_BIT
-        | COMMAND_GRAPH_PASS_BATCH_BIT);
+        | COMMAND_GRAPH_PASS_PACK_BIT);
 
     return 0;
 }

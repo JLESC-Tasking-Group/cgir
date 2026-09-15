@@ -50,7 +50,7 @@
 CGIR_NAMESPACE_USE;
 
 /*
- * BATCH PASS - group same-device "islands" into COMMAND_TYPE_BATCH sub-graphs so
+ * PACK PASS - group same-device "islands" into COMMAND_TYPE_PACK sub-graphs so
  * a driver can capture each island as a single vendor graph (CUDA/HIP graph,
  * Level-Zero command list, ...).
  *
@@ -66,36 +66,36 @@ CGIR_NAMESPACE_USE;
  */
 
 /* per-node pass storage (the device stays on the node: node->device_unique_id) */
-struct batch_pls_t
+struct pack_pls_t
 {
-    bool candidate;                 /* batching candidate (not entry/exit, not an opaque batch/graph node) */
+    bool candidate;                 /* packing candidate (not entry/exit, not an opaque pack/graph node) */
     int cls;                        /* refinement class index, or -1 for a non-candidate */
-    command_graph_node_t * rep;     /* representative top-level node after batching */
+    command_graph_node_t * rep;     /* representative top-level node after packing */
 };
 
 void
-command_graph_t::pass_batch(void)
+command_graph_t::pass_pack(void)
 {
     /* Index every top-level node; node->iterator_index is its index in [0, n). */
     constexpr bool include_entry_exit = true;
-    auto nodes = this->create_node_iterators<include_entry_exit, batch_pls_t>();
+    auto nodes = this->create_node_iterators<include_entry_exit, pack_pls_t>();
     const int n = (int) nodes.size();
-    if (n <= 2)   /* only entry/exit: nothing to batch */
+    if (n <= 2)   /* only entry/exit: nothing to pack */
         return ;
 
     command_graph_node_t * g_entry = this->node_get_entry();
     command_graph_node_t * g_exit  = this->node_get_exit();
 
     /* initialize per-node storage: candidate flag (entry/exit and pre-existing
-     * batches / nested graphs are opaque boundaries, never grouped), refinement
-     * class (none yet), and post-batch representative (self). */
+     * packes / nested graphs are opaque boundaries, never grouped), refinement
+     * class (none yet), and post-pack representative (self). */
     for (int i = 0 ; i < n ; ++i)
     {
         command_graph_node_t * u = nodes[i].node;
         const bool boundary =
             (u == g_entry) || (u == g_exit) ||
             (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND_GRAPH) ||
-            (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command && u->command->type == COMMAND_TYPE_BATCH);
+            (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && u->command && u->command->type == COMMAND_TYPE_PACK);
         nodes[i].data.candidate = !boundary;
         nodes[i].data.cls       = -1;
         nodes[i].data.rep       = u;
@@ -224,8 +224,8 @@ command_graph_t::pass_batch(void)
      * Materialize each island with >= 2 COMMAND members.                   *
      * -------------------------------------------------------------------- */
 
-    /* nodes[i].data.rep already holds each node's post-batch representative
-     * (itself); materialization overwrites it with the BATCH node for members. */
+    /* nodes[i].data.rep already holds each node's post-pack representative
+     * (itself); materialization overwrites it with the PACK node for members. */
     struct island_mat_t
     {
         command_graph_t *      sub;
@@ -252,21 +252,21 @@ command_graph_t::pass_batch(void)
         if (ncmd < 2)
             continue ;
 
-        /* fresh BATCH command + its (initialized) sub command-graph */
+        /* fresh PACK command + its (initialized) sub command-graph */
         assert(this->command_new && this->command_graph_new && this->command_graph_node_new);
-        command_t * cmd = this->command_new(this, COMMAND_TYPE_BATCH);
+        command_t * cmd = this->command_new(this, COMMAND_TYPE_PACK);
         assert(cmd);
 
         command_graph_t * sub = this->command_graph_new(this, nullptr, nullptr);
         assert(sub);
-        cmd->batch.cg = sub;
+        cmd->pack.cg = sub;
 
         command_graph_node_t * s_entry = sub->node_get_entry();
         command_graph_node_t * s_exit  = sub->node_get_exit();
         s_entry->successors.clear();     /* drop the default entry->exit edge */
         s_exit->predecessors.clear();
 
-        /* fresh top-level BATCH node; every member maps to it */
+        /* fresh top-level PACK node; every member maps to it */
         command_graph_node_t * B = this->command_graph_node_new(this, gdev, COMMAND_GRAPH_NODE_TYPE_COMMAND);
         assert(B);
         B->command = cmd;
@@ -277,15 +277,15 @@ command_graph_t::pass_batch(void)
     }
 
     /* Rewire boundaries only: every original edge whose endpoints map to
-     * different representatives is moved onto the batch node(s); internal edges
+     * different representatives is moved onto the pack node(s); internal edges
      * (both endpoints in the same island) are left physically untouched. */
     for (int i = 0 ; i < n ; ++i)
     {
         command_graph_node_t * u  = nodes[i].node;
         assert(u);
 
-        /* Iterate a *copy* of the successors. When u is not itself batched we
-         * have ru == u, so the ru->precedes(rv) below appends the fresh BATCH
+        /* Iterate a *copy* of the successors. When u is not itself packed we
+         * have ru == u, so the ru->precedes(rv) below appends the fresh PACK
          * node to the very list being walked; a std::list iterator stays valid
          * and would reach it. That node has no entry in `nodes` -- its
          * iterator_index is still the constructor's 0, which aliases the graph
@@ -306,7 +306,7 @@ command_graph_t::pass_batch(void)
             assert(rv);
 
             if (ru == rv)           continue; /* internal to one island: keep as-is */
-            if (ru == u && rv == v) continue; /* neither endpoint batched: keep as-is */
+            if (ru == u && rv == v) continue; /* neither endpoint packed: keep as-is */
 
             /* boundary edge: detach the original, add the mapped one (deduplicated) */
             u->successors.erase(std::find(u->successors.begin(), u->successors.end(), v));

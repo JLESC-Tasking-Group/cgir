@@ -265,6 +265,14 @@ struct command_prog_t
      *   - the driver, at first launch, as a backstop for whatever the assembler
      *     did anyway -- and for programs whose code the JIT never saw.
      *
+     * A backstop should be read with tolerance. The levers a driver has are coarse
+     * (a shared-memory carveout is rounded to the device's own buckets, a register
+     * cap moves residency in whole blocks), so insisting on the exact figure
+     * usually means overshooting it, and overshooting downwards does the same harm
+     * as the drift being corrected -- measured at 35% of a reduction kernel's
+     * runtime, to correct a 20% drift. xkrt enforces past a factor of 1.5 either
+     * way and otherwise leaves the program alone.
+     *
      * A driver may clear or overwrite the field once consumed (it is a request,
      * not a durable record). */
     unsigned int blocks_per_sm;

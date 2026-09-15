@@ -56,8 +56,8 @@ CGIR_NAMESPACE_BEGIN
  *
  * IMPORTANT: the declaration order below IS the canonical pipeline order. When a
  * set of passes is requested at once (command_graph_t::optimize(command_graph_pass_set_t)),
- * enabled passes are applied in this order. Keep reductions before batching, and
- * batching last. */
+ * enabled passes are applied in this order. Keep reductions before packing, and
+ * packing last. */
 # define CGIR_FORALL_COMMAND_GRAPH_PASS(F)                                                                                              \
     F(COMMAND_GRAPH_PASS_COPY_FUSE,             pass_copy_fuse,             "copy-fuse",            create_copy_fuse_pass)              \
     F(COMMAND_GRAPH_PASS_REDUCE_NODE,           pass_reduce_node,           "reduce-node",          create_reduce_node_pass)            \
@@ -65,7 +65,7 @@ CGIR_NAMESPACE_BEGIN
     F(COMMAND_GRAPH_PASS_PROG_FUSE,             pass_prog_fuse,             "prog-fuse",            create_prog_fuse_pass)              \
     F(COMMAND_GRAPH_PASS_JIT,                   pass_jit,                   "jit",                  create_jit_pass)                    \
     F(COMMAND_GRAPH_PASS_SEQUENCE,              pass_sequence,              "sequence",             create_sequence_pass)               \
-    F(COMMAND_GRAPH_PASS_BATCH,                 pass_batch,                 "batch",                create_batch_pass)
+    F(COMMAND_GRAPH_PASS_PACK,                  pass_pack,                  "pack",                 create_pack_pass)
 
 enum command_graph_pass_t
 {
@@ -192,7 +192,7 @@ command_graph_pass_set_from_str(const char * s, char * unknown, size_t unknown_s
 
 /* A comma-separated list of every pass name, with a trailing ", " separator,
  * built at compile time from CGIR_FORALL_COMMAND_GRAPH_PASS, e.g.
- * "copy-fuse, reduce-node, transitive-reduction, prog-fuse, jit, sequence, batch, ".
+ * "copy-fuse, reduce-node, transitive-reduction, prog-fuse, jit, sequence, pack, ".
  * The trailing separator lets a caller append a final token (such as "none")
  * without special-casing. Handy for diagnostics that enumerate valid pass names.
  *
