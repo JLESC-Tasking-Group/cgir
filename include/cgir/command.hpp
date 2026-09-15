@@ -316,11 +316,11 @@ struct command_file_t
 
 struct command_graph_t;
 
-/* a batch of multiple dependent commands, contracted by a driver into a single
+/* a pack of multiple dependent commands, contracted by a driver into a single
  * opaque executable (e.g. CUgraphExec on CUDA) */
-struct command_batch_t
+struct command_pack_t
 {
-    /* the command graph of that batch (its `is_serial` flag marks a linear
+    /* the command graph of that pack (its `is_serial` flag marks a linear
      * chain of TASK_SPAWN PROG commands, see command_graph_t) */
     command_graph_t * cg;
 };
@@ -371,7 +371,7 @@ struct command_t
         command_copy_1D_t       copy_1D;
         command_copy_2D_t       copy_2D;
         command_file_t          file;
-        command_batch_t         batch;
+        command_pack_t         pack;
         command_ctrl_loop_t     loop;
         command_ctrl_demux_t    demux;
     };

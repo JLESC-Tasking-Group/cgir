@@ -82,7 +82,7 @@ typedef size_t command_graph_node_index_t;
  * A walk marks a node visited by stamping it with the id of the walk in
  * progress. The id must therefore be unique among all walks a node can ever
  * take part in -- and a node takes part in the walks of every graph that can
- * reach it, not just of the one that allocated it: the `sequence` and `batch`
+ * reach it, not just of the one that allocated it: the `sequence` and `pack`
  * passes build sub-graphs that REUSE the parent's nodes. A per-graph counter
  * would restart at zero in each fresh sub-graph and re-issue ids that its
  * shared nodes still carry from the parent's last walk, which reads as
@@ -328,7 +328,7 @@ struct command_graph_t
 
     /* true iff this graph is a linear chain (A -> B -> ... -> Z) of PROG
      * commands whose launch mode is TASK_SPAWN (i.e. a sequence of OpenMP
-     * tasks). Set by the batch pass on a batch's sub-graph; lets the runtime
+     * tasks). Set by the pack pass on a pack's sub-graph; lets the runtime
      * replay the whole graph as a single "super" task instead of one task per
      * command. */
     bool is_serial = false;
