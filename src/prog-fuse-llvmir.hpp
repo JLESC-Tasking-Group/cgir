@@ -36,9 +36,17 @@ CGIR_NAMESPACE_BEGIN
  *  composable: a program that is itself the result of a previous fusion is
  *  handled correctly, so arbitrary chains fuse into one wrapper.
  *
- *  Requires CGIR_SUPPORT_LLVM; aborts otherwise.
+ *  RETURNS true iff the chain was fused. Refusing a chain is a normal outcome,
+ *  not an error: a chain may be unfusable because a program is not in a form
+ *  this routine handles, or -- for device chains -- because fusing it would not
+ *  preserve the program's meaning (see device_chain_is_fusible). On false, `dst`
+ *  is left EXACTLY as it was and the caller must keep the chain's nodes
+ *  separate; a caller that contracts the chain regardless would execute only
+ *  progs[0]. Only an out-of-memory condition still aborts.
+ *
+ *  Requires CGIR_SUPPORT_LLVM; returns false otherwise.
  */
-void
+bool
 command_graph_prog_fuse_llvmir(
     command_prog_t ** progs,
     size_t n,
@@ -79,6 +87,12 @@ command_prog_launch_params_equal(
     const command_prog_t * a,
     const command_prog_t * b
 ) {
+    /* NOTE: blocks_per_sm is deliberately NOT compared. It is the occupancy each
+     * program happened to be recorded with, which follows from its register
+     * footprint and so differs from kernel to kernel; requiring equality would
+     * refuse almost every fusion. The fused program takes the most restrictive
+     * of its inputs instead (see the launch-parameter propagation in
+     * command_graph_prog_fuse_llvmir). */
     return a->launch_mode == b->launch_mode
         && a->grid.x  == b->grid.x  && a->grid.y  == b->grid.y  && a->grid.z  == b->grid.z
         && a->block.x == b->block.x && a->block.y == b->block.y && a->block.z == b->block.z;

@@ -49,10 +49,10 @@ A program command holds:
 
 | Type                  | Struct                    | Description                           |
 |-----------------------|---------------------------|---------------------------------------|
-| `COMMAND_TYPE_BATCH`  | `cgir::command_batch_t`   | A batch of commands (sub-graph)       |
+| `COMMAND_TYPE_PACK`   | `cgir::command_pack_t`    | A pack of commands (sub-graph)        |
 
-A batch node contains a pointer to a sub `cgir::command_graph_t` and a driver-specific handle.
-Batches are typically created by the [batching optimization pass](@ref optimization_passes).
+A pack node contains a pointer to a sub `cgir::command_graph_t` and a driver-specific handle.
+Batches are typically created by the [packing optimization pass](@ref optimization_passes).
 
 ### Control Flow
 
@@ -75,7 +75,7 @@ struct command_t {
         command_copy_1D_t    copy_1D;
         command_copy_2D_t    copy_2D;
         command_file_t       file;
-        command_batch_t      batch;
+        command_pack_t      pack;
         command_ctrl_loop_t  loop;
         command_ctrl_demux_t demux;
     };

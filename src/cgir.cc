@@ -219,16 +219,16 @@ optimize_dump_graph(
  * on the command graph: its wall-clock time and the graph's node/edge and    *
  * per-command-type counts BEFORE and AFTER the transformation. This is the    *
  * data source for the paper's evaluation (graph reduction, copy/prog fusion,  *
- * batching). It is independent of CGIR_OPTIMIZE_DUMP (which writes .dot).     *
+ * packing). It is independent of CGIR_OPTIMIZE_DUMP (which writes .dot).     *
  *                                                                           *
  * Rows are tagged with CGIR_STATS_TAG (a caller-provided run identifier, set  *
  * per run by the benchmark harness) so a single appended file can hold every  *
  * run of a sweep and be joined back to the harness' runs.csv on that tag.     *
  *                                                                           *
  * Counts are taken over the top-level graph (a forward walk from entry): the  *
- * batch pass collapses a device's commands into a single BATCH node whose     *
- * sub-graph is not descended into, so after batching nodes_after drops and    *
- * batch_after rises -- exactly the signal we want to report.                  *
+ * pack pass collapses a device's commands into a single PACK node whose     *
+ * sub-graph is not descended into, so after packing nodes_after drops and    *
+ * pack_after rises -- exactly the signal we want to report.                  *
  * ------------------------------------------------------------------------- */
 static const char *
 stats_csv_path(void)
@@ -249,7 +249,7 @@ struct cg_metrics_t
 {
     size_t nodes, edges;                    /* totals */
     size_t empty, command, graph, condition;/* by node type */
-    size_t prog, copy1d, copy2d, batch;     /* by command type (COMMAND nodes) */
+    size_t prog, copy1d, copy2d, pack;     /* by command type (COMMAND nodes) */
 };
 
 /* Count nodes, edges and command types over the top-level graph. */
@@ -291,8 +291,8 @@ stats_compute_metrics(command_graph_t * cg)
                         case COMMAND_TYPE_COPY_D2D_2D:
                             m.copy2d += 1;
                             break;
-                        case COMMAND_TYPE_BATCH:
-                            m.batch += 1;
+                        case COMMAND_TYPE_PACK:
+                            m.pack += 1;
                             break;
                         default:
                             break;
@@ -347,7 +347,7 @@ stats_emit(
             "empty_before,empty_after,command_before,command_after,"
             "graph_before,graph_after,"
             "prog_before,prog_after,copy1d_before,copy1d_after,"
-            "copy2d_before,copy2d_after,batch_before,batch_after\n");
+            "copy2d_before,copy2d_after,pack_before,pack_after\n");
 
     const char * tag = getenv("CGIR_STATS_TAG");
     fprintf(f,
@@ -362,7 +362,7 @@ stats_emit(
         b.empty, a.empty, b.command, a.command,
         b.graph, a.graph,
         b.prog, a.prog, b.copy1d, a.copy1d,
-        b.copy2d, a.copy2d, b.batch, a.batch);
+        b.copy2d, a.copy2d, b.pack, a.pack);
 
     fclose(f);
 }

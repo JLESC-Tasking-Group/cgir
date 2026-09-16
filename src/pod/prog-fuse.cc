@@ -50,15 +50,13 @@
 CGIR_NAMESPACE_USE;
 
 /* pass local storage */
-struct pls_t
+struct prog_fuse_pls_t
 {
     bool contracted;
 
-    pls_t(void) : contracted(false) {}
-    ~pls_t(void) {}
+    prog_fuse_pls_t(void) : contracted(false) {}
+    ~prog_fuse_pls_t(void) {}
 };
-
-using node_t = command_graph_t::node_iterator_t<pls_t>;
 
 /* true iff `u` is a command node holding a non-null LLVM-IR program source */
 static inline bool
@@ -75,17 +73,17 @@ void
 command_graph_t::pass_prog_fuse(void)
 {
     constexpr bool include_entry_exit = false;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit, prog_fuse_pls_t>();
 
     /* iterate through each original node */
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
-        node_t & node = nodes[i];
-        command_graph_node_t * u = node.node;
+        auto & it = nodes[i];
+        command_graph_node_t * u = it.node;
         assert(u);
 
         /* if the node was already contracted, ignore it */
-        if (node.data.contracted)
+        if (it.data.contracted)
             continue ;
 
         if (!node_is_llvmir_prog(u))
@@ -99,7 +97,7 @@ command_graph_t::pass_prog_fuse(void)
         while (cur->successors.size() == 1)
         {
             command_graph_node_t * w = cur->successors.front();
-            if (!node_is_llvmir_prog(w) || !this->are_sequence(cur, w))
+            if (!node_is_llvmir_prog(w) || !this->are_serial(cur, w))
                 break ;
             /* only fuse programs with rigorously identical launch parameters
              * (grid/block and launch mode); every chain member must match the head u */
@@ -118,12 +116,17 @@ command_graph_t::pass_prog_fuse(void)
         for (command_graph_node_t * c : chain)
             progs.push_back(&c->command->prog);
 
-        command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &u->command->prog);
+        /* Refusing a chain is a normal outcome (an unhandled program shape, or a
+         * device chain whose meaning fusion would not preserve). The nodes must
+         * then stay separate: contracting them anyway would drop every member
+         * but the head, i.e. silently skip work. Leave them for the next pass. */
+        if (!command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &u->command->prog))
+            continue ;
 
         /* Contract the chain into u (each successive node absorbed in series). */
         for (size_t k = 1 ; k < chain.size() ; ++k)
         {
-            this->contract<COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE | COMMAND_GRAPH_CONTRACTION_HINT_INPLACE>(u, chain[k]);
+            this->contract<COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL | COMMAND_GRAPH_CONTRACTION_HINT_INPLACE>(u, chain[k]);
             nodes[chain[k]->iterator_index].data.contracted = true;
         }
     }

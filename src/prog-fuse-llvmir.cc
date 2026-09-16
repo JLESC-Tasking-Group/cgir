@@ -67,13 +67,24 @@
 # include <cgir/command.hpp>
 
 # include "prog-fuse-llvmir.hpp"
+# include "jit-support.hpp"
 
 # if CGIR_SUPPORT_LLVM
 
+# include <llvm/ADT/DenseMap.h>
+# include <llvm/ADT/DenseSet.h>
+# include <llvm/ADT/PostOrderIterator.h>
+# include <llvm/ADT/StringExtras.h>    /* utostr, for the .minnctapersm attribute */
+# include <llvm/Analysis/AliasAnalysis.h>
 # include <llvm/Analysis/InlineCost.h>
+# include <llvm/Analysis/MemoryLocation.h>
+# include <llvm/Analysis/ScalarEvolution.h>
 # include <llvm/Analysis/ValueTracking.h>
 # include <llvm/IR/Function.h>
+# include <llvm/IR/GlobalVariable.h>
 # include <llvm/IR/IRBuilder.h>
+# include <llvm/IR/Intrinsics.h>
+# include <llvm/IR/IntrinsicsNVPTX.h>
 # include <llvm/IR/CallingConv.h>
 # include <llvm/IR/Instructions.h>
 # include <llvm/IR/IntrinsicInst.h>
@@ -95,6 +106,10 @@
 # include <llvm/TargetParser/Host.h>
 # include <llvm/TargetParser/Triple.h>
 
+/* Lazy device-bitcode materialization (libdevice/DeviceRTL): parse only the
+ * referenced functions instead of the whole (large) library. */
+# include <llvm/Bitcode/BitcodeReader.h>
+
 /* Optimization pipeline (inline + loop-fuse + vectorize) run on the fused
  * module before JIT, so noalias/dedup actually translate into fused loops. */
 # include <llvm/Passes/PassBuilder.h>
@@ -109,6 +124,8 @@
 # include <llvm/Transforms/Scalar/SROA.h>
 # include <llvm/Transforms/Scalar/SimplifyCFG.h>
 # include <llvm/Transforms/InstCombine/InstCombine.h>
+# include <llvm/Transforms/IPO/OpenMPOpt.h>    /* device SPMD-ization before PTX codegen */
+# include <llvm/Transforms/IPO/Internalize.h> /* LTO-style internalize before O3 */
 
 /* In-process JIT (replaces the former Proteus dependency) */
 # include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -126,6 +143,7 @@
 # include <llvm/IR/LegacyPassManager.h>
 # include <llvm/ADT/SmallString.h>
 
+# include <algorithm>
 # include <atomic>
 # include <cassert>
 # include <cstdint>
@@ -133,10 +151,10 @@
 # include <cstdlib>
 # include <cstring>
 # include <memory>
-# include <mutex>
 # include <optional>
 # include <string>
 # include <unordered_map>
+# include <utility>
 # include <vector>
 
 # endif /* CGIR_SUPPORT_LLVM */
@@ -144,6 +162,30 @@
 CGIR_NAMESPACE_USE;
 
 # if CGIR_SUPPORT_LLVM
+
+/* =============================================================================
+ * What is in this file, in order. The `SECTION` banners mark seams: each is a
+ * self-contained concern that can be lifted into its own translation unit (the
+ * first one already has been). Anything lifted needs the -fno-rtti property
+ * CMakeLists sets per LLVM-consuming source.
+ *
+ *   (lifted)   profiling, env knobs, JIT result cache  -> src/jit-support.{hpp,cc}
+ *   SECTION 1  generic LLVM IR utilities               -> llvm-util
+ *   SECTION 2  the prog-fuse pass                      -> stays here
+ *   SECTION 3  device (NVPTX) code generation          -> jit-device
+ *   SECTION 4  host (CPU) code generation              -> jit-host
+ *   SECTION 5  command_graph_jit_llvmir, the entry point that drives 3 and 4
+ * ========================================================================== */
+
+/* Profiling, environment knobs and the JIT result cache hold process-global
+ * state and transform no IR, so they live apart (src/jit-support.hpp). Imported
+ * wholesale rather than qualified at ~40 call sites; the names are distinctive
+ * (scoped_phase_t, cache_*, profiling_*, env_*). */
+using namespace CGIR_NAMESPACE::jit;
+
+/* ---------------------------------------------------------------------------
+ * SECTION 1 - generic LLVM IR utilities shared by the fuse pass and the JIT.
+ * ------------------------------------------------------------------------- */
 
 /**
  *  Parse an LLVM IR (textual .ll, NUL-terminated) or LLVM bitcode (binary) blob
@@ -220,6 +262,19 @@ is_void_ptr_size(const llvm::FunctionType * fty)
            fty->getNumParams() == 2 &&
            fty->getParamType(0)->isPointerTy() &&
            fty->getParamType(1)->isIntegerTy();
+}
+
+/* True iff `fty` is the nanos6 outline shape `void(void*, void*, void*)`: a
+ * void-returning function taking (args block, device env, translation table).
+ * See CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE. */
+static bool
+is_void_ptr_ptr_ptr(const llvm::FunctionType * fty)
+{
+    return fty->getReturnType()->isVoidTy() &&
+           fty->getNumParams() == 3 &&
+           fty->getParamType(0)->isPointerTy() &&
+           fty->getParamType(1)->isPointerTy() &&
+           fty->getParamType(2)->isPointerTy();
 }
 
 /**
@@ -428,21 +483,165 @@ constant_value_equal(llvm::Constant * a, llvm::Constant * b)
     return true;
 }
 
-/* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
- * Inlining N device target-region kernels into one wrapper leaves N
- * `__kmpc_target_init`/`__kmpc_target_deinit` pairs, but a single launch must have
- * exactly ONE. For SPMD kernels (target_init returns -1 => every thread runs the
- * body) with an identical launch configuration, keep the FIRST init and the LAST
- * deinit and drop the inner ones: each removed init's result is replaced by -1 so
- * its "== -1 => body" branch falls through into the body, and each removed deinit
- * is erased. Returns false if the kernels are not the expected SPMD shape or their
- * launch configurations differ (caller must then NOT fuse them). Assumes the
- * inlined bodies appear in launch order (block layout order), which holds since the
- * wrapper calls them in order and we inline in place. */
-static bool
-collapse_device_kernel_brackets(llvm::Function & F)
+/* ---------------------------------------------------------------------------
+ * Grid-wide barrier for fused device kernels.
+ *
+ * Two device programs run as two kernel launches, and the boundary between them
+ * is a device-wide barrier: every thread of the first finishes before any thread
+ * of the second starts. Fusing them into one launch removes it -- nothing in a
+ * single launch orders one block against another -- so the fused kernel has to
+ * put it back, or a program whose second half reads what the first half wrote
+ * (through any thread but its own) silently computes the wrong answer.
+ *
+ * The barrier below is the standard counter-and-generation handshake: one thread
+ * per block arrives, the last arrival releases everyone, and the rest spin on a
+ * generation counter. It is bracketed by block barriers so the whole block is
+ * ordered, not just its leader.
+ *
+ * PRECONDITION: every block of the grid must be resident simultaneously. A block
+ * that has not been scheduled cannot arrive, and the ones that have will spin
+ * forever. This is not checkable from inside the kernel, so it is established
+ * before fusing -- see command_prog_t::max_coresident_blocks and the check in
+ * command_graph_prog_fuse_llvmir -- and the launch must preserve it (in CUDA, a
+ * cooperative launch).
+ * ------------------------------------------------------------------------- */
+
+/* The barrier's shared state, created once per fused module: an arrival counter
+ * that returns to zero at each barrier, and a generation counter that only ever
+ * increases. Zero-initialized, which is the correct starting state, so a replay
+ * needs no reset. */
+struct grid_barrier_state_t
 {
-    std::vector<llvm::CallInst *> inits, deinits;
+    llvm::GlobalVariable * count;
+    llvm::GlobalVariable * generation;
+};
+
+static grid_barrier_state_t
+get_or_create_grid_barrier_state(llvm::Module & M)
+{
+    /* addrspace(1) is NVPTX global memory: visible to every block, which is the
+     * whole point. */
+    constexpr unsigned GLOBAL_AS = 1;
+    llvm::Type * i32 = llvm::Type::getInt32Ty(M.getContext());
+
+    auto get = [&] (const char * name) -> llvm::GlobalVariable *
+    {
+        if (llvm::GlobalVariable * G = M.getGlobalVariable(name, /*AllowInternal*/ true))
+            return G;
+        auto * G = new llvm::GlobalVariable(
+            M, i32, /* isConstant */ false, llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i32, 0), name, /* InsertBefore */ nullptr,
+            llvm::GlobalValue::NotThreadLocal, GLOBAL_AS);
+        G->setAlignment(llvm::Align(4));
+        return G;
+    };
+    return { get("__cgir_grid_barrier_count"), get("__cgir_grid_barrier_gen") };
+}
+
+/* Emit a grid-wide barrier at `b`'s insertion point and leave the builder in the
+ * block execution continues in (which is returned).
+ *
+ * PRECONDITION: the current block has no terminator yet -- this is called while
+ * the fused wrapper is still being built, and it appends the barrier's control
+ * flow rather than splitting an existing block. */
+static llvm::BasicBlock *
+emit_grid_barrier(llvm::IRBuilder<> & b, llvm::Module & M)
+{
+    llvm::LLVMContext & ctx = M.getContext();
+    llvm::Type * i32 = llvm::Type::getInt32Ty(ctx);
+    llvm::Function * F = b.GetInsertBlock()->getParent();
+    grid_barrier_state_t st = get_or_create_grid_barrier_state(M);
+
+    auto k0 = [&] { return llvm::ConstantInt::get(i32, 0); };
+    auto k1 = [&] { return llvm::ConstantInt::get(i32, 1); };
+
+    /* Read a nullary NVPTX special register (tid, nctaid, ...). */
+    auto sreg = [&] (llvm::Intrinsic::ID id) -> llvm::Value *
+    {
+        return b.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(&M, id), {});
+    };
+    /* __syncthreads(): barrier 0, all threads of the block, aligned. */
+    auto block_barrier = [&] ()
+    {
+        b.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                         &M, llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all),
+                     { k0() });
+    };
+
+    /* 1. Order the block, so its leader speaks for threads that have all
+     *    finished the preceding body. */
+    block_barrier();
+
+    /* 2. One thread per block takes part in the grid handshake. */
+    llvm::Value * is_leader = b.CreateAnd(
+        b.CreateAnd(
+            b.CreateICmpEQ(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x), k0()),
+            b.CreateICmpEQ(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_y), k0())),
+        b.CreateICmpEQ(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_tid_z), k0()));
+
+    llvm::BasicBlock * leader  = llvm::BasicBlock::Create(ctx, "cgir.gb.leader",  F);
+    llvm::BasicBlock * release = llvm::BasicBlock::Create(ctx, "cgir.gb.release", F);
+    llvm::BasicBlock * wait    = llvm::BasicBlock::Create(ctx, "cgir.gb.wait",    F);
+    llvm::BasicBlock * done    = llvm::BasicBlock::Create(ctx, "cgir.gb.done",    F);
+    llvm::BasicBlock * cont    = llvm::BasicBlock::Create(ctx, "cgir.gb.cont",    F);
+    b.CreateCondBr(is_leader, leader, done);
+
+    /* 3. Leader: note the generation, then arrive. */
+    b.SetInsertPoint(leader);
+    llvm::Value * gen0 = b.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, st.generation, k0(),
+        llvm::MaybeAlign(4), llvm::AtomicOrdering::Acquire);
+
+    llvm::Value * nblocks = b.CreateMul(
+        b.CreateMul(sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_x),
+                    sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_y)),
+        sreg(llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_z));
+
+    llvm::Value * arrived = b.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, st.count, k1(),
+        llvm::MaybeAlign(4), llvm::AtomicOrdering::AcquireRelease);
+    b.CreateCondBr(b.CreateICmpEQ(arrived, b.CreateSub(nblocks, k1())),
+                   release, wait);
+
+    /* 3a. Last to arrive: reset the counter, then publish the new generation.
+     *     In that order, or a block entering the NEXT barrier could see a count
+     *     that still includes this one. */
+    b.SetInsertPoint(release);
+    b.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, st.count, k0(),
+                      llvm::MaybeAlign(4), llvm::AtomicOrdering::Release);
+    b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, st.generation, k1(),
+                      llvm::MaybeAlign(4), llvm::AtomicOrdering::AcquireRelease);
+    b.CreateBr(done);
+
+    /* 3b. Everyone else spins until the generation moves. The read is an atomic
+     *     add of zero rather than a load, so it cannot be hoisted out of the
+     *     loop. */
+    b.SetInsertPoint(wait);
+    llvm::Value * gen = b.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, st.generation, k0(),
+        llvm::MaybeAlign(4), llvm::AtomicOrdering::Acquire);
+    b.CreateCondBr(b.CreateICmpEQ(gen, gen0), wait, done);
+
+    /* 4. Re-join the block: the threads that were not the leader waited here,
+     *    and none of them may enter the next body before it has been released. */
+    b.SetInsertPoint(done);
+    block_barrier();
+    b.CreateBr(cont);
+
+    b.SetInsertPoint(cont);
+    return cont;
+}
+
+/* Collect the per-kernel target_init / target_deinit calls of `F`, in block
+ * order. Split out because the brackets must be re-found after the canonicalizing
+ * passes below, which may replace the instructions holding them. */
+static void
+collect_device_kernel_brackets(llvm::Function & F,
+                               std::vector<llvm::CallInst *> & inits,
+                               std::vector<llvm::CallInst *> & deinits)
+{
+    inits.clear();
+    deinits.clear();
     for (llvm::BasicBlock & BB : F)
         for (llvm::Instruction & I : BB)
             if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
@@ -451,10 +650,36 @@ collapse_device_kernel_brackets(llvm::Function & F)
                     if (cf->getName() == "__kmpc_target_init")   inits.push_back(CI);
                     else if (cf->getName() == "__kmpc_target_deinit") deinits.push_back(CI);
                 }
+}
+
+/* Collapse the per-kernel OpenMP-device runtime brackets in a fused device kernel.
+ * Inlining N device target-region kernels into one wrapper leaves N
+ * `__kmpc_target_init`/`__kmpc_target_deinit` pairs, but a single launch must have
+ * exactly ONE. For SPMD kernels (target_init returns -1 => every thread runs the
+ * body) with an identical launch configuration, keep the FIRST init and the LAST
+ * deinit and drop the inner ones: each removed init's result is replaced by -1 so
+ * its "== -1 => body" branch falls through into the body, and each removed deinit
+ * is erased. Returns false if the kernels are not the expected SPMD shape or their
+ * launch configurations differ; the caller must then NOT fuse them. Assumes the
+ * inlined bodies appear in launch order (block layout order), which holds since
+ * the wrapper calls them in order and we inline in place. `why` receives the
+ * reason when it returns false.
+ *
+ * The ordering the removed launch boundaries used to provide is restored by the
+ * grid-wide barrier the wrapper emits between consecutive bodies -- see
+ * emit_grid_barrier(); this routine only removes the brackets. */
+static bool
+collapse_device_kernel_brackets(llvm::Function & F, std::string & why)
+{
+    std::vector<llvm::CallInst *> inits, deinits;
+    collect_device_kernel_brackets(F, inits, deinits);
 
     /* need N matched pairs (N == number of fused kernels >= 2) */
     if (inits.size() < 2 || inits.size() != deinits.size())
+    {
+        why = "the inlined bodies do not have matched target_init/deinit pairs";
         return false;
+    }
 
     /* All kernels must share the launch configuration: the first field of
      * KernelEnvironmentTy (ConfigurationEnvironmentTy), which holds only integers
@@ -473,10 +698,16 @@ collapse_device_kernel_brackets(llvm::Function & F)
     };
     llvm::Constant * cfg0 = config_of(inits[0]);
     if (cfg0 == nullptr)
+    {
+        why = "a kernel environment is not a readable constant";
         return false;
+    }
     for (size_t i = 1 ; i < inits.size() ; ++i)
         if (!constant_value_equal(config_of(inits[i]), cfg0))
+        {
+            why = "the kernels have differing launch configurations";
             return false;
+        }
 
     /* Each init must be the SPMD pattern: its result feeds `icmp eq <res>, -1`. */
     auto is_spmd_init = [] (llvm::CallInst * init) -> bool
@@ -491,7 +722,10 @@ collapse_device_kernel_brackets(llvm::Function & F)
     };
     for (llvm::CallInst * init : inits)
         if (!is_spmd_init(init))
+        {
+            why = "a kernel is not in SPMD form";
             return false;
+        }
 
     /* keep inits[0] and deinits[last]; drop the inner brackets */
     llvm::Type * i32 = llvm::Type::getInt32Ty(F.getContext());
@@ -513,9 +747,14 @@ static void dump_module(const std::string & dir, const char * name, llvm::Module
  * merged module, so the inlined kernels' loops can vectorize/fuse. `dump_dir` is
  * the (possibly empty) CGIR_PROG_FUSE_DUMP directory: when set, the wrapper is
  * dumped after the SROA+noalias cleanup and BEFORE loop-fusion, so the exact IR
- * LoopFuse operates on can be inspected. */
+ * LoopFuse operates on can be inspected.
+ *
+ * `run_o3`: host chains run the final O3 here; DEVICE chains pass false and keep
+ * only the fusion-specific loop work, deferring O3 to emit_device_ptx (which runs
+ * after the DeviceRTL is linked, so O3 can inline the runtime). */
 static void
-optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir)
+optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir,
+                bool run_o3 = true)
 {
     llvm::PassBuilder PB(tm);
 
@@ -594,8 +833,11 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & 
         MPM2.run(M, MAM);
     }
 
-    llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
-    MPM.run(M, MAM);
+    if (run_o3)
+    {
+        llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+        MPM.run(M, MAM);
+    }
 }
 
 /* ------------------------------------------------------------------------- *
@@ -616,8 +858,7 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & 
 static bool
 dump_enabled(const char * var)
 {
-    const char * s = getenv(var);
-    return s && s[0] != '\0' && strcmp(s, "0") != 0;
+    return env_flag(var);
 }
 
 /* Create (mkdir -p) a fresh dump directory <base>/<prefix>-<seq> and return its
@@ -673,7 +914,62 @@ dump_module(const std::string & dir, const char * name, llvm::Module & M)
 
 # endif /* CGIR_SUPPORT_LLVM */
 
-void
+/* ---------------------------------------------------------------------------
+ * SECTION 2 - the prog-fuse pass: merge a chain of programs into one.
+ * ------------------------------------------------------------------------- */
+
+/* Diagnostics for a refused fusion. Guarded like everything else that needs the
+ * LLVM-only includes (<string> among them); without LLVM the pass refuses before
+ * it can reach them. */
+# if CGIR_SUPPORT_LLVM
+
+/* Names for the two enums a refusal needs to report. Local to the diagnostics:
+ * a wrong name here misreports, it does not misbehave. */
+static const char *
+launch_mode_name(command_prog_launch_mode_t m)
+{
+    switch (m)
+    {
+        case CGIR_COMMAND_PROG_LAUNCH_MODE_DIRECT:     return "DIRECT";
+        case CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN: return "TASK_SPAWN";
+    }
+    return "?";
+}
+
+static const char *
+prototype_name(command_prog_function_prototype_t p)
+{
+    switch (p)
+    {
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_FIXED:    return "FIXED";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC: return "VARIADIC";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_KMP:      return "KMP";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED:   return "PACKED";
+        case CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6:   return "NANOS6";
+    }
+    return "?";
+}
+
+/* What a program is, for a refusal message. Whether a chain that cannot be fused
+ * is a device kernel missing its launch geometry, or a host task body that was
+ * classified as a device program, is not something the reason alone can tell
+ * apart -- and they call for opposite fixes. */
+static std::string
+prog_describe(const command_prog_t * p)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "launch=%s prototype=%s grid=%ux%ux%u block=%ux%ux%u symbol='%s'",
+             launch_mode_name(p->launch_mode), prototype_name(p->prototype),
+             p->grid.x, p->grid.y, p->grid.z,
+             p->block.x, p->block.y, p->block.z,
+             p->source.content.llvmir.symbol ? p->source.content.llvmir.symbol : "");
+    return std::string(buf);
+}
+
+# endif /* CGIR_SUPPORT_LLVM */
+
+bool
 CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     command_prog_t ** progs,
     size_t n,
@@ -682,9 +978,86 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     # if !CGIR_SUPPORT_LLVM
     (void) progs; (void) n; (void) dst;
     fprintf(stderr, "prog-fuse: LLVM support not enabled (rebuild with -DUSE_LLVM=ON)\n");
-    abort();
+    return false;
     # else
     assert(n >= 2);
+
+    scoped_phase_t _fuse_total("fuse-total");
+
+    /* Device (GPU) fusion: the chain's PROGs carry a device codegen target
+     * (triple/arch). Homogeneous by construction (a device kernel only chains with
+     * others on the same device via equal launch params). The fused entry is a
+     * single `ptx_kernel` (see below) compiled to PTX by the jit pass.
+     *
+     * Decided here, before a single module is parsed. Every condition below reads
+     * a plain field of `progs[]`, so refusing costs nothing at this point --
+     * whereas refusing after the parse throws away the parse, and a chain that
+     * cannot be fused is not rare enough for that to be free: on the applications
+     * we measure, every device chain is declined, and parsing them first cost
+     * 6--290 ms per run. */
+    const char * dev_triple = progs[0]->source.content.llvmir.triple;
+    const char * dev_arch   = progs[0]->source.content.llvmir.arch;
+    const bool   device     = (dev_triple != nullptr);
+    if (device)
+    {
+        for (size_t i = 0 ; i < n ; ++i)
+            if (progs[i]->source.content.llvmir.triple == nullptr)
+            {
+                fprintf(stderr, "prog-fuse: cannot mix device and host programs in one "
+                                "fused chain (program %zu)\n", i);
+                return false;
+            }
+
+        /* A fused device program is one launch, so the ordering its constituents
+         * used to get from the launch boundary must come from a grid-wide barrier
+         * inside the kernel. That barrier only completes if every block is
+         * resident: a block the hardware has not scheduled never arrives, and the
+         * ones that have spin forever. Establish it here, where refusing is free,
+         * rather than discovering it as a hang at replay.
+         *
+         * The bound has to hold for the program this pass is about to BUILD, not
+         * for the ones it is given. Fusion inlines every constituent into one
+         * kernel, so the result asks for at least as many registers as the
+         * greediest of them and generally more, and occupancy falls as registers
+         * rise -- the fused kernel therefore fits *fewer* blocks per SM than any
+         * measurement taken beforehand suggests. Sizing the check on the
+         * constituents' occupancy (`max_coresident_blocks`, measured by the
+         * runtime on the un-fused kernels) is thus an over-estimate, and one that
+         * fails late and hard: the launch is rejected by the driver
+         * (CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE) once the graph is already
+         * fused and there is nothing left to fall back to.
+         *
+         * So the check uses the only occupancy that holds whatever fusion does to
+         * the register count: one block per multiprocessor, which any launchable
+         * kernel achieves by definition. `max_coresident_blocks` is
+         * multiprocessors x blocks-per-SM, so the multiprocessor count divides
+         * back out of the two figures the runtime reports. */
+        const uint64_t blocks = (uint64_t) progs[0]->grid.x
+                              * (uint64_t) progs[0]->grid.y
+                              * (uint64_t) progs[0]->grid.z;
+        const unsigned coresident = progs[0]->max_coresident_blocks;
+        const unsigned per_sm     = progs[0]->blocks_per_sm;
+        if (coresident == 0 || per_sm == 0)
+        {
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: the "
+                            "runtime did not report how many blocks fit on the device, "
+                            "so the grid-wide barrier a fused kernel needs cannot be "
+                            "shown to complete [%s]\n",
+                    n, prog_describe(progs[0]).c_str());
+            return false;
+        }
+        const unsigned nsm = coresident / per_sm;   /* multiprocessors */
+        if (nsm == 0 || blocks > (uint64_t) nsm)
+        {
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: its "
+                            "grid of %llu blocks exceeds the %u multiprocessors, and a "
+                            "fused kernel is only guaranteed one resident block each, "
+                            "so a grid-wide barrier could hang [%s]\n",
+                    n, (unsigned long long) blocks, nsm,
+                    prog_describe(progs[0]).c_str());
+            return false;
+        }
+    }
 
     /* ------------------------------------------------------------------ *
      * 0. One-time LLVM global initialisation                             *
@@ -707,14 +1080,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (progs[i]->source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
         {
             fprintf(stderr, "prog-fuse: program %zu is not LLVM IR\n", i);
-            abort();
+            return false;
         }
         mods[i] = parse_llvmir(
             static_cast<const char *>(progs[i]->source.content.llvmir.raw),
             progs[i]->source.content.llvmir.size,
             *ctx
         );
-        if (!mods[i]) { fprintf(stderr, "prog-fuse: failed to parse program %zu\n", i); abort(); }
+        if (!mods[i]) { fprintf(stderr, "prog-fuse: failed to parse program %zu\n", i); return false; }
 
         /* dump the original input IR (before prefixing/linking) */
         if (dump)
@@ -739,6 +1112,10 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     {
         std::string          fused_name;  /* entry name after prefixing */
         bool                 is_wrapper;  /* true if entry is void(void**) */
+        /* true if entry is a nanos6 outline void(void*, void*, void*): fused at
+         * the program level. Each constituent is called with its per-instance
+         * (args, dev, translation); no per-slot args are consumed (no dedup). */
+        bool                 is_outline;
         /* true if entry is a packed self-contained body void(void*, size_t): its
          * arg slots (&value) come from the params table (one per capture), not the
          * IR parameters (which are just the buffer pointer + size). Fusion
@@ -774,6 +1151,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         llvm::Function * entry = nullptr;
         bool is_wrapper = false;
+        bool is_outline = false;
         bool is_packed_leaf = false;
         size_t buf_size = 0;
         unsigned arity = 0;
@@ -805,12 +1183,26 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (!entry || entry->isDeclaration())
             {
                 fprintf(stderr, "prog-fuse: no entry found in task-spawn program %zu\n", i);
-                abort();
+                return false;
             }
 
             llvm::FunctionType * fty = entry->getFunctionType();
             const command_prog_param_t * params = progs[i]->source.content.llvmir.params;
-            if (is_void_voidptr(fty))
+            if (progs[i]->source.content.llvmir.proto == CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE)
+            {
+                /* nanos6 outline void(args, dev, translation): fused at the program
+                 * level (each constituent called with its per-instance pointers),
+                 * so it consumes no per-slot args and needs no value dedup. */
+                if (!is_void_ptr_ptr_ptr(fty))
+                {
+                    fprintf(stderr, "prog-fuse: nanos6 outline program %zu entry '%s' is not "
+                                    "void(void*,void*,void*)\n", i, entry->getName().str().c_str());
+                    return false;
+                }
+                is_outline = true;
+                arity      = 0;
+            }
+            else if (is_void_voidptr(fty))
             {
                 is_wrapper = true;
                 arity      = (unsigned) progs[i]->n_args;
@@ -825,7 +1217,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 {
                     fprintf(stderr, "prog-fuse: cannot re-fuse packed fused program %zu "
                                     "(no params table)\n", i);
-                    abort();
+                    return false;
                 }
                 is_packed_leaf = true;
                 arity          = (unsigned) progs[i]->source.content.llvmir.param_count;
@@ -855,7 +1247,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (!entry || entry->isDeclaration())
             {
                 fprintf(stderr, "prog-fuse: entry symbol '%s' not found in program %zu\n", sym, i);
-                abort();
+                return false;
             }
             is_wrapper = false;
             arity      = entry->getFunctionType()->getNumParams();
@@ -883,7 +1275,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (entry == nullptr)
         {
             entry = find_kernel(M);
-            if (!entry) { fprintf(stderr, "prog-fuse: no kernel found in program %zu\n", i); abort(); }
+            if (!entry) { fprintf(stderr, "prog-fuse: no kernel found in program %zu\n", i); return false; }
             is_wrapper = false;
             arity      = entry->getFunctionType()->getNumParams();
         }
@@ -894,7 +1286,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         {
             fprintf(stderr, "prog-fuse: program %zu has no variadic args populated "
                             "(fusible progs must use the variadic launcher)\n", i);
-            abort();
+            return false;
         }
         inputs[i].slots.resize(arity);
         for (unsigned k = 0 ; k < arity ; ++k)
@@ -907,6 +1299,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         inputs[i].fused_name     = std::string(prefix) + name;
         inputs[i].is_wrapper     = is_wrapper;
+        inputs[i].is_outline     = is_outline;
         inputs[i].is_packed_leaf = is_packed_leaf;
         inputs[i].buf_size       = buf_size;
         inputs[i].arity          = arity;
@@ -956,23 +1349,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             {
                 fprintf(stderr, "prog-fuse: cannot mix packed and non-packed task "
                                 "bodies in one fused chain (program %zu)\n", i);
-                abort();
+                return false;
             }
 
-    /* Device (GPU) fusion: the chain's PROGs carry a device codegen target
-     * (triple/arch). Homogeneous by construction (a device kernel only chains with
-     * others on the same device via equal launch params). The fused entry is a
-     * single `ptx_kernel` (see below) compiled to PTX by the jit pass. */
-    const char * dev_triple = progs[0]->source.content.llvmir.triple;
-    const char * dev_arch   = progs[0]->source.content.llvmir.arch;
-    const bool   device     = (dev_triple != nullptr);
-    if (device)
+    /* nanos6 outline fusion is likewise homogeneous: the fused entry has the
+     * 3-array outline ABI, which cannot also express leaf/wrapper inputs. */
+    bool any_outline = false;
+    for (size_t i = 0 ; i < n ; ++i)
+        any_outline |= inputs[i].is_outline;
+    if (any_outline)
         for (size_t i = 0 ; i < n ; ++i)
-            if (progs[i]->source.content.llvmir.triple == nullptr)
+            if (!inputs[i].is_outline)
             {
-                fprintf(stderr, "prog-fuse: cannot mix device and host programs in one "
-                                "fused chain (program %zu)\n", i);
-                abort();
+                fprintf(stderr, "prog-fuse: cannot mix nanos6 outline and non-outline "
+                                "task bodies in one fused chain (program %zu)\n", i);
+                return false;
             }
 
     std::vector<void *>                    unique_slots;
@@ -1093,7 +1484,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (linker.linkInModule(std::move(mods[i])))
         {
             fprintf(stderr, "prog-fuse: linking program %zu failed\n", i);
-            abort();
+            return false;
         }
     }
 
@@ -1116,7 +1507,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (!F)
         {
             fprintf(stderr, "prog-fuse: symbol '%s' missing after link\n", inputs[i].fused_name.c_str());
-            abort();
+            return false;
         }
 
         /* fold the constituent into __fused_wrapper */
@@ -1188,6 +1579,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * never the host void** packed byte-buffer shapes. */
     if (device)
         packed_output = false;
+    /* nanos6 outline fusion has its own 3-array entry (not a packed byte buffer). */
+    if (any_outline)
+        packed_output = false;
 
     std::vector<size_t> slot_offset(total_args, 0);
     size_t packed_size = 0;
@@ -1254,6 +1648,13 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         kernel_calls.reserve(n);
         for (size_t i = 0 ; i < n ; ++i)
         {
+            /* Restore the ordering the launch boundary used to give. Emitting it
+             * here -- between the calls, before they are inlined -- means it does
+             * not depend on anything about the bodies' shape: whatever they turn
+             * into, the barrier stays between them. */
+            if (i > 0)
+                emit_grid_barrier(builder, *mod_u);
+
             llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
             std::vector<llvm::Value *> call_args;
             call_args.reserve(inputs[i].arity);
@@ -1271,7 +1672,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             if (!llvm::InlineFunction(*ci, ifi).isSuccess())
             {
                 fprintf(stderr, "prog-fuse: failed to inline a device kernel\n");
-                abort();
+                return false;
             }
         }
 
@@ -1321,11 +1722,78 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
 
         /* collapse the N target_init/deinit brackets into one (SPMD + same config;
          * aborts if that precondition does not hold). */
-        if (!collapse_device_kernel_brackets(*wrapper))
+        std::string why;
+        if (!collapse_device_kernel_brackets(*wrapper, why))
         {
-            fprintf(stderr, "prog-fuse: device kernels are not fusible "
-                            "(non-SPMD or differing launch configuration)\n");
-            abort();
+            /* Not an error: the chain simply stays as N separate launches. Say
+             * why, because "fusion did not happen" is otherwise invisible in the
+             * results and indistinguishable from "fusion did not pay". */
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: %s\n",
+                    n, why.c_str());
+            return false;
+        }
+    }
+    else if (any_outline)
+    {
+        /* nanos6 outline chain (program-level fusion): build
+         *   void __fused_wrapper(void** args_v, void** dev_v, void** transl_v)
+         * that calls each constituent outline i with its per-instance triple
+         *   (args_v[i], dev_v[i], transl_v[i])
+         * then inlines them so the O3 pipeline can merge the bodies and fuse
+         * loops where dependence analysis proves it legal. No argument dedup:
+         * outlines consume whole per-instance pointers, not per-value slots. */
+        llvm::FunctionType * wfty = llvm::FunctionType::get(
+            void_ty, { ptr_ty, ptr_ty, ptr_ty }, false);
+        llvm::Function * wrapper = llvm::Function::Create(
+            wfty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
+
+        /* the three arrays are distinct allocations (from each other and from the
+         * task data), so mark them noalias to free the per-instance slot loads. */
+        wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
+        wrapper->addParamAttr(1, llvm::Attribute::NoAlias);
+        wrapper->addParamAttr(2, llvm::Attribute::NoAlias);
+
+        llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
+        llvm::IRBuilder<> builder(bb);
+
+        auto load_slot = [&] (llvm::Value * base, size_t idx) -> llvm::Value *
+        {
+            llvm::Value * p = builder.CreateGEP(
+                ptr_ty, base, llvm::ConstantInt::get(i64_ty, idx), "slot");
+            return builder.CreateLoad(ptr_ty, p, "inst");
+        };
+
+        std::vector<llvm::CallInst *> kernel_calls;
+        kernel_calls.reserve(n);
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
+            llvm::Value * a = load_slot(wrapper->getArg(0), i);
+            llvm::Value * d = load_slot(wrapper->getArg(1), i);
+            llvm::Value * t = load_slot(wrapper->getArg(2), i);
+            kernel_calls.push_back(builder.CreateCall(fn->getFunctionType(), fn, { a, d, t }));
+        }
+        builder.CreateRetVoid();
+
+        /* inline the outlines (they are AlwaysInline internal defs) so O3 sees one
+         * body; O3's inliner then pulls in their single-use internal callees. */
+        for (llvm::CallInst * ci : kernel_calls)
+        {
+            llvm::InlineFunctionInfo ifi;
+            llvm::InlineResult ir = llvm::InlineFunction(*ci, ifi);
+            if (!ir.isSuccess())
+            {
+                fprintf(stderr, "prog-fuse: failed to inline a nanos6 outline: %s\n",
+                        ir.getFailureReason());
+                return false;
+            }
+        }
+
+        for (size_t i = 0 ; i < n ; ++i)
+        {
+            llvm::Function * F = mod_u->getFunction(inputs[i].fused_name);
+            if (F && F->use_empty())
+                F->eraseFromParent();
         }
     }
     else
@@ -1527,7 +1995,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (!ir.isSuccess())
         {
             fprintf(stderr, "prog-fuse: failed to inline a kernel: %s\n", ir.getFailureReason());
-            abort();
+            return false;
         }
     }
 
@@ -1586,7 +2054,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (!tgt)
         {
             fprintf(stderr, "prog-fuse: cannot find target '%s': %s\n", TT.str().c_str(), err.c_str());
-            abort();
+            return false;
         }
         llvm::TargetOptions opts;
         tm.reset(tgt->createTargetMachine(
@@ -1603,18 +2071,18 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     if (llvm::verifyModule(*mod_u, &llvm::errs()))
     {
         fprintf(stderr, "prog-fuse: merged module verification failed\n");
-        abort();
+        return false;
     }
 
     /* dump the merged module (wrapper + constituents) before optimization */
     if (dump)
         dump_module(dump_dir, "merged.ll", *mod_u);
 
-    /* ------------------------------------------------------------------ *
-     * 8. Optimize (inline the kernels into the wrapper, vectorize, fuse).  *
-     * ------------------------------------------------------------------ */
+    /* 8. Optimize (inline the kernels into the wrapper, vectorize, fuse). Device
+     * chains defer the final O3 to emit_device_ptx (post DeviceRTL link); host
+     * chains run the full pipeline here. */
     if (tm)
-        optimize_module(*mod_u, tm.get(), dump_dir);
+        optimize_module(*mod_u, tm.get(), dump_dir, /* run_o3 = */ !device);
 
     /* dump the final fused/optimized module */
     if (dump)
@@ -1655,12 +2123,15 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * so clear the per-input symbol; device chains must name it so the driver can
      * cuModuleGetFunction the PTX entry. (dst may alias progs[0] whose triple/arch
      * are preserved here, driving the jit pass's PTX codegen.) */
-    dst->source.content.llvmir.symbol = device ? "__fused_wrapper" : nullptr;
-    /* the fused entry is void(void**) (or void(void*,size_t) when packed); it
-     * carries no per-parameter table (a re-fusion detects its shape by signature). */
-    dst->source.content.llvmir.proto        = packed_output
-        ? CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
-        : CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR;
+    dst->source.content.llvmir.symbol = (device || any_outline) ? "__fused_wrapper" : nullptr;
+    /* the fused entry is void(void**), void(void*,size_t) when packed, or
+     * void(void**,void**,void**) for a nanos6 outline chain; it carries no
+     * per-parameter table (a re-fusion detects its shape by signature). */
+    dst->source.content.llvmir.proto        = any_outline
+        ? CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE
+        : (packed_output
+            ? CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
+            : CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR);
     dst->source.content.llvmir.params       = nullptr;
     dst->source.content.llvmir.param_count  = 0;
     dst->source.content.llvmir._params_owned = false;
@@ -1773,12 +2244,17 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * JIT-compiled (the `jit` pass fills the launcher fn). It is either a uniform
      * void(void**) VARIADIC program or, under CGIR_PROG_FUSE_PACKED, a
      * void(void*, size_t) PACKED program over the packed byte buffer. */
-    dst->prototype             = packed_output
-        ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
-        : CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    dst->prototype             = any_outline
+        ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
+        : (packed_output
+            ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+            : CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC);
     dst->launcher.variadic.fn  = nullptr;  /* compiled by the `jit` pass */
     dst->args                  = args_buf;
-    dst->n_args                = n_args;
+    /* For a nanos6 outline chain, n_args is the fused-instance count (the runtime
+     * passes args/dev/translation arrays of this length); the compacted args
+     * buffer is unused by the nanos6 launcher. */
+    dst->n_args                = any_outline ? n : n_args;
     dst->args_size             = packed_output ? packed_size : 0;
     dst->_args_owned           = true;  /* heap (calloc/malloc) — the pass owns it */
 
@@ -1793,7 +2269,25 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *  on dst aliasing progs[0]) so a distinct dst is correct too.        *
      *  progs[0]'s grid/block/launch_mode are never freed/modified above,  *
      *  so reading them here is safe even when dst == progs[0].            *
+     *                                                                     *
+     *  The occupancy target is NOT uniform across the inputs (it follows  *
+     *  from each kernel's per-block resource use), and the fused kernel   *
+     *  replaces all of them at once, so it takes the most restrictive     *
+     *  non-zero value -- zero meaning "unconstrained" and losing to any   *
+     *  real target. Dynamic shared memory is a requirement rather than a  *
+     *  limit, so the fused program needs the largest of its inputs'.      *
      * ------------------------------------------------------------------ */
+    unsigned int fused_blocks_per_sm = 0;
+    unsigned int fused_dyn_shmem     = 0;
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        const unsigned int b = progs[i]->blocks_per_sm;
+        if (b && (fused_blocks_per_sm == 0 || b < fused_blocks_per_sm))
+            fused_blocks_per_sm = b;
+        if (progs[i]->dyn_shmem > fused_dyn_shmem)
+            fused_dyn_shmem = progs[i]->dyn_shmem;
+    }
+
     if (dst != progs[0])
     {
         dst->grid        = progs[0]->grid;
@@ -1806,6 +2300,15 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         assert(memcmp(&dst->block, &progs[0]->block, sizeof(dst->block)) == 0);
         assert(dst->launch_mode == progs[0]->launch_mode);
     }
+    dst->blocks_per_sm = fused_blocks_per_sm;
+    dst->dyn_shmem     = fused_dyn_shmem;
+    /* Carry the residency budget forward, and tell the runtime that this kernel
+     * now contains a grid-wide barrier: it must be launched so that every block
+     * runs at once (a cooperative launch, in CUDA), or the barrier never
+     * completes. The precondition was checked above; this is how the launcher
+     * learns it has to honour it. */
+    dst->max_coresident_blocks    = progs[0]->max_coresident_blocks;
+    dst->requires_coresident_grid = device;
 
     /* ------------------------------------------------------------------ *
      * 12. Release the consumed inputs' owned heap buffers.                 *
@@ -1855,50 +2358,336 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         }
     }
 
+    return true;
+
     # endif /* CGIR_SUPPORT_LLVM */
 }
 
 # if CGIR_SUPPORT_LLVM
-/* Link the OpenMP device runtime (DeviceRTL) bitcode at `bc_path` into `M` so the
- * device-runtime externs the kernel references (e.g. __kmpc_target_init) become
- * defined. Without this the CUDA driver cannot JIT the emitted PTX -- ptxas fails
- * on the unresolved externs (CUDA_ERROR_INVALID_PTX / 218). Only the referenced
- * symbols and their transitive dependencies are imported (LinkOnlyNeeded), so the
- * rest of the (large) runtime is not pulled in. Returns false + sets `err`. */
+/* Link the device bitcode at `bc_path` into `M` so the externs the kernel
+ * references (e.g. __kmpc_target_init, __nv_cbrt) become defined. Without this the
+ * CUDA driver cannot JIT the emitted PTX -- ptxas fails on the unresolved externs.
+ * Only referenced symbols and their transitive deps are imported (LinkOnlyNeeded),
+ * so the rest of the (large) library is not pulled in. Returns false + sets `err`. */
 static bool
-link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
+link_device_bitcode(llvm::Module & M, const char * bc_path, std::string & err)
 {
-    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf =
-        llvm::MemoryBuffer::getFile(bc_path);
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buf = [&] {
+        scoped_phase_t _p("dev-link-read");
+        return llvm::MemoryBuffer::getFile(bc_path);
+    }();
     if (!buf)
     {
-        err = "cannot read CGIR_DEVICE_RTL_BC '" + std::string(bc_path) + "': " +
+        err = "cannot read device bitcode '" + std::string(bc_path) + "': " +
               buf.getError().message();
         return false;
     }
 
-    llvm::SMDiagnostic diag;
-    std::unique_ptr<llvm::Module> rtl =
-        llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
-    if (!rtl)
+    /* Parse the library. For bitcode (libdevice/DeviceRTL are .bc), load it LAZILY:
+     * function bodies are materialized on demand, so the following LinkOnlyNeeded
+     * link only deserializes the referenced functions instead of the whole (large)
+     * library. getOwningLazyBitcodeModule takes ownership of the buffer (kept alive
+     * for on-demand materialization). Fall back to eager parseIR for textual IR. */
+    std::unique_ptr<llvm::Module> lib;
     {
-        err = "parse DeviceRTL bitcode '" + std::string(bc_path) + "' failed: " +
-              diag.getMessage().str();
-        return false;
+        scoped_phase_t _p("dev-link-parse");
+        const unsigned char * s = (const unsigned char *) (*buf)->getBufferStart();
+        const unsigned char * e = (const unsigned char *) (*buf)->getBufferEnd();
+        if (llvm::isBitcode(s, e))
+        {
+            auto m = llvm::getOwningLazyBitcodeModule(std::move(*buf), M.getContext(),
+                                                      /* ShouldLazyLoadMetadata */ true);
+            if (!m)
+            {
+                err = "lazy-parse device bitcode '" + std::string(bc_path) + "' failed: " +
+                      llvm::toString(m.takeError());
+                return false;
+            }
+            lib = std::move(*m);
+        }
+        else
+        {
+            llvm::SMDiagnostic diag;
+            lib = llvm::parseIR((*buf)->getMemBufferRef(), diag, M.getContext());
+            if (!lib)
+            {
+                err = "parse device bitcode '" + std::string(bc_path) + "' failed: " +
+                      diag.getMessage().str();
+                return false;
+            }
+        }
     }
 
     /* Align triple/DataLayout with the destination so the linker does not refuse
-     * on a mismatch (the RTL is already nvptx64, same as M). */
-    rtl->setTargetTriple(M.getTargetTriple());
-    rtl->setDataLayout(M.getDataLayout());
+     * on a mismatch (the library is already nvptx64, same as M). */
+    lib->setTargetTriple(M.getTargetTriple());
+    lib->setDataLayout(M.getDataLayout());
 
     llvm::Linker linker(M);
-    if (linker.linkInModule(std::move(rtl), llvm::Linker::Flags::LinkOnlyNeeded))
+    bool link_failed;
     {
-        err = "linking DeviceRTL bitcode '" + std::string(bc_path) + "' failed";
+        scoped_phase_t _p("dev-link-linkin");
+        link_failed = linker.linkInModule(std::move(lib), llvm::Linker::Flags::LinkOnlyNeeded);
+    }
+    if (link_failed)
+    {
+        err = "linking device bitcode '" + std::string(bc_path) + "' failed";
         return false;
     }
     return true;
+}
+
+/* Ensure OpenMPOpt recognizes the module and its kernels: the "openmp"/
+ * "openmp-device" module flags (else it early-exits) and the "kernel" attribute
+ * on each kernel-CC entry (else getDeviceKernels() skips it, so the entry is not
+ * preserved and its SPMD transforms are skipped). Idempotent; the flag value is
+ * tested for presence only. */
+static void
+prepare_device_module_for_openmp(llvm::Module & M)
+{
+    if (!M.getModuleFlag("openmp"))
+        M.addModuleFlag(llvm::Module::Max, "openmp", 51);
+    if (!M.getModuleFlag("openmp-device"))
+        M.addModuleFlag(llvm::Module::Max, "openmp-device", 51);
+    for (llvm::Function & F : M)
+        if (F.hasKernelCallingConv() && !F.isDeclaration() && !F.hasFnAttribute("kernel"))
+            F.addFnAttr("kernel");
+}
+
+/* Build the standard analysis managers + PassBuilder for `tm` and run `body`,
+ * which appends passes to the given ModulePassManager. Factored out so the
+ * pre-link (SPMD-ization) and post-link (O3) steps share the setup. */
+template <typename BuildFn>
+static void
+run_module_passes(llvm::Module & M, llvm::TargetMachine * tm, BuildFn && body)
+{
+    llvm::PassBuilder PB(tm);
+
+    llvm::LoopAnalysisManager     LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager    CGAM;
+    llvm::ModuleAnalysisManager   MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    llvm::ModulePassManager MPM;
+    body(PB, MPM);
+    MPM.run(M, MAM);
+}
+
+/* ---------------------------------------------------------------------------
+ * SECTION 3 - device (NVPTX) code generation: SPMD-ize the recorded snapshot,
+ * link the device libraries, optimize, emit PTX.
+ * ------------------------------------------------------------------------- */
+
+/* Pre-link stage, run on the raw generic-mode snapshot BEFORE the DeviceRTL is
+ * linked in. Two shapes, selected by CGIR_JIT_DEVICE_LTO:
+ *
+ *   LTO (default) -- buildLTOPreLinkDefaultPipeline(O3), the very pipeline clang
+ *     runs on a device translation unit under -foffload-lto. OpenMPOpt is inside
+ *     it (buildModuleSimplificationPipeline), placed after the early
+ *     SROA/EarlyCSE/SimplifyCFG cleanup, so it SPMD-izes from SSA values instead
+ *     of from the frontend's allocas.
+ *
+ *   legacy -- OpenMPOpt alone, leaving all optimization to the post-link stage.
+ *
+ * Both must be a NON-post-link phase and both must precede the link, for the
+ * same reason: SPMD-ization needs the SPMD runtime
+ * (__kmpc_get_hardware_thread_id_in_block, __kmpc_barrier_simple_spmd) to be
+ * "available", and post-link that means already defined -- which the generic
+ * snapshot cannot arrange, since it does not reference them yet and a
+ * LinkOnlyNeeded link therefore would not import them. A non-post-link phase
+ * instead assumes they arrive later, which is exactly what happens: OpenMPOpt
+ * emits the SPMD calls and the following link resolves them. FullLTOPreLink is
+ * non-post-link (OpenMPOpt treats only FullLTOPostLink and the ThinLTO phases as
+ * post-link), so the LTO shape keeps that property. */
+static void
+optimize_device_module_prelink(llvm::Module & M, llvm::TargetMachine * tm)
+{
+    prepare_device_module_for_openmp(M);
+    run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+        if (device_lto_pipeline())
+            MPM.addPass(PB.buildLTOPreLinkDefaultPipeline(llvm::OptimizationLevel::O3));
+        else
+            MPM.addPass(llvm::OpenMPOptPass(llvm::ThinOrFullLTOPhase::None));
+    });
+}
+
+/* Post-link finalize, run AFTER the DeviceRTL is linked into `M`: inline the
+ * just-linked runtime, fold the (now constant) kernel-environment config, DCE
+ * what is left and vectorize. Two shapes, selected by CGIR_JIT_DEVICE_LTO:
+ *
+ *   LTO (default) -- buildLTODefaultPipeline(O3), what clang-nvlink-wrapper runs
+ *     at the device link under -foffload-lto (via LTOBackend). Passing a null
+ *     ExportSummary is the regular-LTO, no-index configuration, the same one
+ *     `opt -passes='lto<O3>'` uses. What it adds over a per-module pipeline is
+ *     OpenMPOpt in the FullLTOPostLink phase -- the only phase that runs the
+ *     runtime-symbol cleanup and the only one in which OpenMPOpt is honest about
+ *     which runtime functions actually exist -- plus the LTO-specific IPO
+ *     ordering.
+ *
+ *   legacy -- buildPerModuleDefaultPipeline(O3), which is also what LLVM's own
+ *     offload JIT runs (offload/plugins-nextgen/common/src/JIT.cpp).
+ *
+ * On Krylov CG the two shapes emit code of indistinguishable quality: the gap
+ * against the ahead-of-time kernel was never in the IR, it was the register
+ * budget ptxas picks (see the .minnctapersm declaration in
+ * command_graph_jit_llvmir). The LTO shape is the default for fidelity, and
+ * because it is cheaper: simplifying before the link costs less in the pre-link
+ * stage than it saves in the post-link one (measure with CGIR_JIT_TIMING=1 --
+ * the two stages are the dev-spmdize and dev-o3 buckets). */
+static void
+optimize_device_module_postlink(llvm::Module & M, llvm::TargetMachine * tm)
+{
+    prepare_device_module_for_openmp(M);   // idempotent; robust to link side-effects
+
+    /* LTO-style internalization (matches the offload backend, which derives it
+     * from the linker's symbol resolutions): the DeviceRTL is linked weak/hidden,
+     * so its config globals (@__omp_rtl_debug_kind = 0, ...) are not
+     * constant-foldable and its unused functions are not DCE-able. Internalizing
+     * everything but the kernel entries makes them 'internal', so O3 folds the
+     * debug/assert machinery away and globalDCE drops the dead runtime.
+     * llvm.used members are auto-preserved. */
+    llvm::internalizeModule(M, [] (const llvm::GlobalValue & GV) -> bool {
+        // keep kernel entries external (resolved by name via cuModuleGetFunction)
+        if (const auto * F = llvm::dyn_cast<llvm::Function>(&GV))
+            return F->hasKernelCallingConv();
+        return false;
+    });
+
+    run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+        if (!device_lto_pipeline())
+        {
+            MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
+            return ;
+        }
+
+        /* The device libraries arrive BETWEEN the two stages, and libdevice's
+         * math functions are still guarded by __nvvm_reflect (FTZ and friends)
+         * while the DeviceRTL reads thread/block indices whose ranges are only
+         * known from the kernel's launch bounds. The ahead-of-time compiler
+         * never faces this: clang links both bitcode libraries at cc1 time, so
+         * the pipeline-start extension point of its pre-link pipeline -- which
+         * is where the NVPTX target installs nvvm-reflect and nvvm-intr-range --
+         * already sees them. Here the only pipeline running after the link is
+         * the LTO one, and an LTO pipeline invokes the FullLinkTimeOptimization
+         * extension points, not PipelineStart. Reproduce it by name (the NVPTX
+         * TargetMachine registers both in NVPTXPassRegistry.def, hooked up by
+         * the PassBuilder constructor) so the post-link O3 optimizes resolved
+         * code instead of carrying both sides of a branch it cannot fold.
+         *
+         * Parsed into a scratch manager and only adopted on success: a target
+         * without these passes is not an error, it just has nothing to do. The
+         * single-pipeline branch above needs none of this -- a per-module
+         * pipeline does invoke PipelineStart, so it picks them up on its own. */
+        llvm::ModulePassManager pre;
+        if (llvm::Error err = PB.parsePassPipeline(
+                pre, "nvvm-reflect,function(nvvm-intr-range)"))
+            llvm::consumeError(std::move(err));
+        else
+            MPM.addPass(std::move(pre));
+
+        MPM.addPass(PB.buildLTODefaultPipeline(llvm::OptimizationLevel::O3,
+                                               /* ExportSummary */ nullptr));
+    });
+}
+
+/* ---------------------------------------------------------------------------
+ * SECTION 4 - host (CPU) code generation: retarget at the running machine,
+ * optimize, emit an object, link it into the process with ORC.
+ * ------------------------------------------------------------------------- */
+
+/* Let every definition in `M` be compiled for the machine we are running on.
+ *
+ * A TargetMachine's CPU and features are only a *default*: the backends prefer a
+ * function's own `target-cpu`/`target-features` attributes whenever they are
+ * present, and the compiler stamped those on everything with the baseline the
+ * application was built for. So a JIT that does nothing here re-optimizes and
+ * re-codegens at that baseline, and the host detection is wasted -- throwing away
+ * the one advantage it has over the ahead-of-time compiler, which is knowing the
+ * exact machine.
+ *
+ * Dropping the attributes is enough, and is better than writing our own: the
+ * function then falls back to the TargetMachine, which
+ * JITTargetMachineBuilder::detectHost() has already configured with the host CPU
+ * name and its full feature set. Nothing here has to construct a feature string,
+ * so nothing here can mis-form one. The vector-width hints go too, having been
+ * derived from the abandoned feature set; declarations are left alone, carrying
+ * no code. */
+static void
+stamp_host_target_attrs(llvm::Module & M)
+{
+    for (llvm::Function & F : M)
+    {
+        if (F.isDeclaration())
+            continue ;
+        F.removeFnAttr("target-cpu");
+        F.removeFnAttr("target-features");
+        F.removeFnAttr("tune-cpu");
+        F.removeFnAttr("min-legal-vector-width");
+        F.removeFnAttr("prefer-vector-width");
+    }
+}
+
+/* Optimize a JIT'd host task module before codegen (host analogue of
+ * optimize_device_module_postlink): O3 optimizes the pre-optimization frontend
+ * snapshot -- there is no link stage here, so the pipeline stays single-phase.
+ * Also promote available_externally definitions (inline callees the closure keeps
+ * only for inlining, e.g. a `declare target` SQRT) to internal, so codegen emits
+ * them instead of dropping them into unresolvable externals. Externalized globals
+ * are plain external declarations, so they are left untouched. */
+static void
+optimize_host_module(llvm::Module & M, llvm::TargetMachine * tm, llvm::StringRef entry_name)
+{
+    for (llvm::Function & F : M)
+        if (F.hasAvailableExternallyLinkage() && !F.isDeclaration())
+            F.setLinkage(llvm::GlobalValue::InternalLinkage);
+    for (llvm::GlobalVariable & G : M.globals())
+        if (G.hasAvailableExternallyLinkage() && G.hasInitializer())
+            G.setLinkage(llvm::GlobalValue::InternalLinkage);
+
+    /* Only the entry is looked up after linking, so everything else can be
+     * internal -- which is what lets O3 propagate the arguments the wrapper
+     * loads into the body, drop the dead parameters, and DCE what is left. Kept
+     * external, the task body is an ABI-visible symbol and none of that applies.
+     * (The device path internalizes for the same reason, and the fuse pass does
+     * not need to because it force-inlines everything into its wrapper.)
+     * llvm.used members are preserved automatically. */
+    llvm::internalizeModule(M, [&] (const llvm::GlobalValue & GV) -> bool {
+        return GV.getName() == entry_name;
+    });
+
+    run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+        MPM.addPass(PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3));
+    });
+}
+
+/* The subtarget feature string the compiler stamped on the device functions
+ * (e.g. "+ptx92,+sm_90"). The TargetMachine's *default* subtarget is what the
+ * NVPTX AsmPrinter uses for the `.version`/`.target` PTX header and what the
+ * backend uses for anything not attached to a function, so building it with an
+ * empty feature string silently downgrades the emitted PTX ISA version below
+ * what the (per-function) subtarget selects instructions for. Prefer the kernel
+ * entry's attribute, then any function's. */
+static std::string
+device_features_of(const llvm::Module & M)
+{
+    const llvm::Function * fallback = nullptr;
+    for (const llvm::Function & F : M)
+    {
+        if (F.isDeclaration() || !F.hasFnAttribute("target-features"))
+            continue ;
+        if (F.hasKernelCallingConv())
+            return F.getFnAttribute("target-features").getValueAsString().str();
+        if (fallback == nullptr)
+            fallback = &F;
+    }
+    return fallback ? fallback->getFnAttribute("target-features").getValueAsString().str()
+                    : std::string();
 }
 
 /* Emit PTX for a device (GPU) module: build a device TargetMachine for `triple`
@@ -1908,35 +2697,57 @@ link_device_runtime(llvm::Module & M, const char * bc_path, std::string & err)
  * to SASS at cuModuleLoadData (see the xkrt driver). */
 static std::string
 emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
-                const char * runtime_bc, std::string & err)
+                const char * const * libs, size_t nlibs,
+                const std::string & dump_dir, std::string & err)
 {
     llvm::Triple TT(triple);
     std::string terr;
     const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT, terr);
     if (!T) { err = "lookupTarget('" + TT.str() + "'): " + terr; return {}; }
 
+    /* Read the features off the snapshot BEFORE anything is linked/optimized in:
+     * at this point the module holds only the compiler-emitted device functions. */
+    const std::string features = device_features_of(M);
+
     llvm::TargetOptions opts;
     std::unique_ptr<llvm::TargetMachine> TM(T->createTargetMachine(
-        TT, arch ? arch : "", /* features */ "", opts,
+        TT, arch ? arch : "", features, opts,
         std::nullopt, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
     if (!TM) { err = "createTargetMachine failed"; return {}; }
 
     M.setTargetTriple(TT);
     M.setDataLayout(TM->createDataLayout());
 
-    /* Resolve the device-runtime externs the kernel references (e.g. __kmpc_*) by
-     * linking a runtime bitcode before codegen, so ptxas can JIT the PTX at
-     * cuModuleLoadData. The path is the producer-supplied `runtime_bc` (see the
-     * prog source), overridable for debugging by the CGIR_DEVICE_RTL_BC env var.
-     * Inert when neither is set. */
-    const char * rtl_bc = getenv("CGIR_DEVICE_RTL_BC");
-    if (!rtl_bc || !rtl_bc[0])
-        rtl_bc = runtime_bc;
-    if (rtl_bc && rtl_bc[0])
+    scoped_phase_t _emit("dev-emit-total");
+
+    /* 1. Pre-link: SPMD-ize (and, under CGIR_JIT_DEVICE_LTO, optimize) the
+     * generic-mode snapshot. Must precede the link -- see the function. */
     {
-        if (!link_device_runtime(M, rtl_bc, err))
-            return {};
+        scoped_phase_t _p("dev-spmdize");
+        optimize_device_module_prelink(M, TM.get());
     }
+
+    if (!dump_dir.empty())
+        dump_module(dump_dir, "prelinked.ll", M);
+
+    /* 2. Link the device bitcode libraries the kernel references (in order, so a
+     * later library can resolve externs of an earlier one), so ptxas can JIT the
+     * PTX at cuModuleLoadData. CGIR_DEVICE_EXTRA_BC adds one more for debugging. */
+    for (size_t i = 0 ; i < nlibs ; ++i)
+        if (libs[i] && libs[i][0] && !link_device_bitcode(M, libs[i], err))
+            return {};
+    if (const char * extra = getenv("CGIR_DEVICE_EXTRA_BC"); extra && extra[0])
+        if (!link_device_bitcode(M, extra, err))
+            return {};
+
+    /* 3. Post-link: O3 to AOT quality (inline runtime, fold config, DCE, vectorize). */
+    {
+        scoped_phase_t _p("dev-o3");
+        optimize_device_module_postlink(M, TM.get());
+    }
+
+    if (!dump_dir.empty())
+        dump_module(dump_dir, "optimized.ll", M);
 
     llvm::SmallString<0> out;
     llvm::raw_svector_ostream os(out);
@@ -1944,268 +2755,32 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
     if (TM->addPassesToEmitFile(pm, os, /* DwoOut */ nullptr,
                                 llvm::CodeGenFileType::AssemblyFile))
     { err = "addPassesToEmitFile: PTX (assembly) emission not supported"; return {}; }
-    pm.run(M);
+    {
+        scoped_phase_t _p("dev-ptx-emit");
+        pm.run(M);
+    }
     return std::string(out.begin(), out.end());
 }
-# endif /* CGIR_SUPPORT_LLVM */
 
-void
-CGIR_NAMESPACE::command_graph_jit_llvmir(
-    command_prog_t * prog
-) {
-    # if !CGIR_SUPPORT_LLVM
-    (void) prog;
-    fprintf(stderr, "jit: LLVM support not enabled (rebuild with -DUSE_LLVM=ON)\n");
-    abort();
-    # else
-    assert(prog);
-    assert(prog->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR);
-    assert(prog->source.content.llvmir.raw != nullptr);
-
-    ensure_llvm_initialized();
-
-    /* Optional IR dumping for debugging (CGIR_JIT_DUMP). */
-    const bool  dump     = dump_enabled("CGIR_JIT_DUMP");
-    std::string dump_dir = dump ? dump_make_dir("CGIR_JIT_DUMP", "jit") : std::string();
-
-    /* parse the program's IR/bitcode into its own context */
-    auto ctx = std::make_unique<llvm::LLVMContext>();
-    std::unique_ptr<llvm::Module> mod = parse_llvmir(
-        static_cast<const char *>(prog->source.content.llvmir.raw),
-        prog->source.content.llvmir.size,
-        *ctx
-    );
-    if (!mod) { fprintf(stderr, "jit: failed to parse program IR\n"); abort(); }
-
-    /* dump the program IR as parsed, before any transform */
-    if (dump)
-        dump_module(dump_dir, "input.ll", *mod);
-
-    /* Resolve the entry function: prefer the explicit symbol (e.g. a device
-     * kernel sub-module with several definitions); else a fused program exposes
-     * __fused_wrapper(void**); else the first externally-linked definition (the
-     * task/kernel entry externalized for JIT); else the first void definition. */
-    llvm::Function * entry = nullptr;
-    if (const char * sym = prog->source.content.llvmir.symbol)
-        entry = mod->getFunction(sym);
-    else if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
-        entry = w;
-    else
+/* Install a compiled host JIT result onto `prog`, shared by the fresh-compile
+ * path and the in-process cache-hit path. For a STANDALONE packed leaf it also
+ * materializes the per-instance packed byte buffer from the recorded &value slots
+ * (params != NULL identifies the standalone case; prog-fuse clears params on a
+ * fused packed program). That packing is per-instance -- each prog has its own
+ * args -- so it runs on cache hits too; it is idempotent (args_size == 0 guard). */
+static void
+install_host_jit_result(command_prog_t * prog, void * fn_addr,
+                        bool entry_is_nanos6, bool entry_is_packed)
+{
+    if (entry_is_nanos6)
     {
-        for (llvm::Function & F : *mod)
-            if (!F.isDeclaration() && F.hasExternalLinkage())
-            {
-                entry = &F;
-                break ;
-            }
-        if (entry == nullptr)
-            entry = find_kernel(*mod);
+        prog->prototype          = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6;
+        prog->launcher.nanos6.fn = reinterpret_cast<void (*)(void **, void **, void **)>(fn_addr);
     }
-
-    /* Skip (do not abort) commands whose entry is not externally JIT-resolvable
-     * - e.g. a not-yet-externalized internal task body, or a fixed-launcher
-     * command that carries a source but is not a JIT target. Leaves the
-     * launcher untouched. */
-    if (entry == nullptr || entry->isDeclaration() || entry->hasLocalLinkage())
-        return ;
-
-    /* Device (GPU) target: compile the (fused) device kernel to PTX for the
-     * device's triple/arch instead of the in-process host JIT. The PTX is stored
-     * back in the source; the driver JIT-loads it (cuModuleLoadData) and resolves
-     * the entry (source.symbol) at launch. The launcher fn is left null (the
-     * driver fills it once the module is loaded). */
-    if (const char * dtriple = prog->source.content.llvmir.triple)
+    else if (entry_is_packed)
     {
-        std::string perr;
-        std::string ptx = emit_device_ptx(*mod, dtriple,
-                                           prog->source.content.llvmir.arch,
-                                           prog->source.content.llvmir.runtime_bc, perr);
-        if (ptx.empty())
-        {
-            fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
-            abort();
-        }
-        if (dump)
-        {
-            std::string path = dump_dir + "/final.ptx";
-            std::error_code ec;
-            llvm::raw_fd_ostream f(path, ec, llvm::sys::fs::OF_Text);
-            if (!ec) f << ptx;
-        }
-
-        /* replace the source IR with the emitted PTX (owned); keep the entry symbol
-         * so the driver can cuModuleGetFunction it. */
-        if (prog->source.content.llvmir._owned && prog->source.content.llvmir.raw)
-            free(prog->source.content.llvmir.raw);
-        char * buf = static_cast<char *>(malloc(ptx.size() + 1));
-        if (!buf) { fprintf(stderr, "jit(device): malloc failed\n"); abort(); }
-        memcpy(buf, ptx.data(), ptx.size());
-        buf[ptx.size()] = '\0';
-        prog->source.type                  = COMMAND_PROG_SOURCE_TYPE_PTX;
-        prog->source.content.llvmir.raw    = buf;
-        prog->source.content.llvmir.size   = ptx.size() + 1; /* incl. NUL */
-        prog->source.content.llvmir._owned = true;
-        /* device kernels launch through the VARIADIC (kernelParams=args) path; the
-         * driver reinterprets launcher.variadic.fn as the loaded device function,
-         * resolved lazily at launch (null until then). */
-        prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
-        prog->launcher.variadic.fn = nullptr;
-        return ;
-    }
-
-    /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
-     * packed body, `void(void*, size_t)` (PACKED). If the entry already has one
-     * of those shapes, use it directly; otherwise synthesize a void(void**)
-     * wrapper that unpacks the argument slots and calls the entry. */
-    llvm::FunctionType * efty = entry->getFunctionType();
-    std::string lookup_name;
-    const bool entry_is_packed = is_void_ptr_size(efty);
-    if (is_void_voidptr(efty) || entry_is_packed)
-    {
-        lookup_name = entry->getName().str();
-    }
-    else
-    {
-        llvm::LLVMContext & C = mod->getContext();
-        llvm::Type * void_ty = llvm::Type::getVoidTy(C);
-        llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(C);
-
-        llvm::FunctionType * wfty = llvm::FunctionType::get(void_ty, { ptr_ty }, false);
-        llvm::Function * wrapper = llvm::Function::Create(
-            wfty, llvm::GlobalValue::ExternalLinkage, "__cgir_jit_wrapper", mod.get());
-
-        llvm::BasicBlock * bb = llvm::BasicBlock::Create(C, "entry", wrapper);
-        llvm::IRBuilder<> b(bb);
-        llvm::Value * args_ptr = wrapper->getArg(0);
-
-        std::vector<llvm::Value *> call_args;
-        call_args.reserve(efty->getNumParams());
-        for (unsigned k = 0 ; k < efty->getNumParams() ; ++k)
-            call_args.push_back(emit_load_arg(b, args_ptr, k, efty->getParamType(k)));
-        b.CreateCall(efty, entry, call_args);
-        b.CreateRetVoid();
-
-        lookup_name = "__cgir_jit_wrapper";
-    }
-
-    /* Compile with the LARGE code model. The JIT places compiled code in a fresh
-     * mapping that can be >2GB away from the process objects this program binds
-     * to (externalized globals installed as absolute symbols, libc functions,
-     * ...). Small/medium models reference those via 32-bit PC-relative
-     * relocations (R_X86_64_PC32) that cannot span that distance; the large
-     * model uses 64-bit absolute addressing, reachable anywhere. Set it on both
-     * the module (flag) and the JIT target machine so codegen honors it. */
-    mod->setCodeModel(llvm::CodeModel::Large);
-
-    /* dump the final IR handed to the JIT (with wrapper synthesis, if any) */
-    if (dump)
-        dump_module(dump_dir, "final.ll", *mod);
-
-    /* JIT-compile in-process (large code model, see above) */
-    auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
-    if (!jtmb)
-    {
-        llvm::logAllUnhandledErrors(jtmb.takeError(), llvm::errs(), "jit: ");
-        fprintf(stderr, "jit: failed to detect host JIT target machine\n");
-        abort();
-    }
-    jtmb->setCodeModel(llvm::CodeModel::Large);
-
-    auto jit_exp = llvm::orc::LLJITBuilder()
-        .setJITTargetMachineBuilder(std::move(*jtmb))
-        .create();
-    if (!jit_exp)
-    {
-        llvm::logAllUnhandledErrors(jit_exp.takeError(), llvm::errs(), "jit: ");
-        fprintf(stderr, "jit: failed to create LLJIT\n");
-        abort();
-    }
-    std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
-
-    /* Resolve symbols the program references but does not define:
-     *
-     *  1. Externalized globals — the producer turned the program's shared data
-     *     globals into external declarations and recorded their real runtime
-     *     addresses (source.content.llvmir.externs). Install them as absolute
-     *     symbols so the compiled code binds to the process's real objects
-     *     instead of module-local copies.
-     *
-     *  2. Everything else (e.g. libc `printf`, other exported process symbols)
-     *     via a generator over the current process's dynamic symbols. */
-    {
-        llvm::orc::JITDylib & jd = jit->getMainJITDylib();
-
-        const cgir_command_prog_extern_t * externs = prog->source.content.llvmir.externs;
-        const size_t n_externs = prog->source.content.llvmir.externs_count;
-        if (externs && n_externs)
-        {
-            llvm::orc::SymbolMap syms;
-            for (size_t i = 0 ; i < n_externs ; ++i)
-            {
-                if (externs[i].name == nullptr)
-                    continue ;
-                syms[jit->mangleAndIntern(externs[i].name)] =
-                    llvm::orc::ExecutorSymbolDef(
-                        llvm::orc::ExecutorAddr::fromPtr(externs[i].addr),
-                        llvm::JITSymbolFlags::Exported);
-            }
-            if (!syms.empty())
-            {
-                if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms))))
-                {
-                    llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
-                    fprintf(stderr, "jit: failed to install externalized-global symbols\n");
-                    abort();
-                }
-            }
-        }
-
-        auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-            jit->getDataLayout().getGlobalPrefix());
-        if (!gen)
-        {
-            llvm::logAllUnhandledErrors(gen.takeError(), llvm::errs(), "jit: ");
-            fprintf(stderr, "jit: failed to create process symbol generator\n");
-            abort();
-        }
-        jd.addGenerator(std::move(*gen));
-    }
-
-    llvm::orc::ThreadSafeModule tsm(std::move(mod), std::move(ctx));
-    if (auto err = jit->addIRModule(std::move(tsm)))
-    {
-        llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
-        fprintf(stderr, "jit: failed to add IR module to LLJIT\n");
-        abort();
-    }
-
-    auto sym = jit->lookup(lookup_name);
-    if (!sym)
-    {
-        llvm::logAllUnhandledErrors(sym.takeError(), llvm::errs(), "jit: ");
-        fprintf(stderr, "jit: could not resolve '%s' after JIT\n", lookup_name.c_str());
-        abort();
-    }
-    /* keep the JIT (hence the compiled code) alive for the process lifetime */
-    void * fn_addr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
-    jit.release();
-
-    /* Install the compiled function, overwriting any previous value. A packed
-     * entry keeps the PACKED prototype (launched as fn(args, args_size)); anything
-     * else becomes a uniform void(void**) VARIADIC program over prog->args (a
-     * recorded OpenMP task was KMP before this; its kargs stay in prog->args). */
-    if (entry_is_packed)
-    {
-        /* A STANDALONE packed leaf (never fused) still carries the recorded
-         * per-value &value slots (void** args) plus its params table (prog-fuse
-         * clears params on a fused packed program, so params != NULL identifies
-         * the standalone case). The packed launcher expects a single packed byte
-         * buffer, so materialize it here from the slots at the params' offsets --
-         * the same layout the packed body reads. */
         const cgir_command_prog_param_t * params = prog->source.content.llvmir.params;
         const size_t nparams = prog->source.content.llvmir.param_count;
-        /* args_size == 0 means the recorded void** slots have not been packed yet
-         * (prog-fuse/a prior jit set args_size > 0), keeping this idempotent. */
         if (params != nullptr && nparams > 0 && prog->args_size == 0)
         {
             size_t buf_size = 0;
@@ -2236,5 +2811,548 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
         prog->launcher.variadic.fn = reinterpret_cast<void (*)(void **)>(fn_addr);
     }
+}
+
+/* Replace a device prog's source IR with emitted/cached PTX (owned copy), keeping
+ * the entry symbol so the driver can cuModuleGetFunction it. Shared by the fresh
+ * emit and the cache-hit paths; leaves launcher null (the driver fills it). */
+static void
+restore_device_ptx(command_prog_t * prog, const std::string & ptx)
+{
+    if (prog->source.content.llvmir._owned && prog->source.content.llvmir.raw)
+        free(prog->source.content.llvmir.raw);
+    char * buf = static_cast<char *>(malloc(ptx.size() + 1));
+    if (!buf) { fprintf(stderr, "jit(device): malloc failed\n"); abort(); }
+    memcpy(buf, ptx.data(), ptx.size());
+    buf[ptx.size()] = '\0';
+    prog->source.type                  = COMMAND_PROG_SOURCE_TYPE_PTX;
+    prog->source.content.llvmir.raw    = buf;
+    prog->source.content.llvmir.size   = ptx.size() + 1; /* incl. NUL */
+    prog->source.content.llvmir._owned = true;
+    prog->prototype            = CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    prog->launcher.variadic.fn = nullptr;
+}
+
+/* Resolve the symbols a host program references but does not define: externalized
+ * globals as absolute symbols (their real runtime addresses, so compiled code
+ * binds to the process's objects) + a generator over the process's dynamic symbols
+ * (libc printf, ...). Shared by the fresh-compile and disk-object load paths. */
+static void
+setup_host_jit_symbols(llvm::orc::LLJIT & jit, const command_prog_t * prog)
+{
+    llvm::orc::JITDylib & jd = jit.getMainJITDylib();
+
+    const cgir_command_prog_extern_t * externs = prog->source.content.llvmir.externs;
+    const size_t n_externs = prog->source.content.llvmir.externs_count;
+    if (externs && n_externs)
+    {
+        llvm::orc::SymbolMap syms;
+        for (size_t i = 0 ; i < n_externs ; ++i)
+        {
+            if (externs[i].name == nullptr)
+                continue ;
+            syms[jit.mangleAndIntern(externs[i].name)] =
+                llvm::orc::ExecutorSymbolDef(
+                    llvm::orc::ExecutorAddr::fromPtr(externs[i].addr),
+                    llvm::JITSymbolFlags::Exported);
+        }
+        if (!syms.empty())
+            if (auto err = jd.define(llvm::orc::absoluteSymbols(std::move(syms))))
+            {
+                llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
+                fprintf(stderr, "jit: failed to install externalized-global symbols\n");
+                abort();
+            }
+    }
+
+    auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+        jit.getDataLayout().getGlobalPrefix());
+    if (!gen)
+    {
+        llvm::logAllUnhandledErrors(gen.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: failed to create process symbol generator\n");
+        abort();
+    }
+    jd.addGenerator(std::move(*gen));
+}
+# endif /* CGIR_SUPPORT_LLVM */
+
+/* ---------------------------------------------------------------------------
+ * SECTION 5 - the jit pass entry point: resolve the entry, then hand it to the
+ * device or host code generator above.
+ * ------------------------------------------------------------------------- */
+
+void
+CGIR_NAMESPACE::command_graph_jit_llvmir(
+    command_prog_t * prog
+) {
+    # if !CGIR_SUPPORT_LLVM
+    (void) prog;
+    fprintf(stderr, "jit: LLVM support not enabled (rebuild with -DUSE_LLVM=ON)\n");
+    abort();
+    # else
+    assert(prog);
+    assert(prog->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR);
+    assert(prog->source.content.llvmir.raw != nullptr);
+
+    scoped_phase_t _jit_total("jit-total");
+
+    /* Result-cache key from the source bytes/attributes (no parse needed): a hit
+     * reuses a prior instance's artifact, skipping parse + the compile pipeline.
+     * The key covers everything a recompile would reproduce, so a hit is
+     * byte-identical to recompiling. */
+    const uint64_t key       = cache_key(prog);
+    const bool     is_device = (prog->source.content.llvmir.triple != nullptr);
+
+    /* Fast path (pre-parse): reuse a cached artifact directly. Device PTX (from
+     * this process or a prior run on disk); host compiled function pointer (this
+     * process only -- disk objects are loaded further down, needing the entry). */
+    if (is_device)
+    {
+        std::string ptx;
+        if (const int hit = cache_device_get(key, ptx))
+        {
+            restore_device_ptx(prog, ptx);
+            if (profiling_stats_on()) profiling_cache_event(true, hit == 1 ? 1 : 2);
+            return ;
+        }
+    }
+    else
+    {
+        int    proto_hit = 0;
+        void * fn_hit     = nullptr;
+        if (cache_host_get_fn(key, &proto_hit, &fn_hit))
+        {
+            install_host_jit_result(prog, fn_hit,
+                proto_hit == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6,
+                proto_hit == (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED);
+            if (profiling_stats_on()) profiling_cache_event(false, 2);
+            return ;
+        }
+    }
+
+    ensure_llvm_initialized();
+
+    /* Optional IR dumping for debugging (CGIR_JIT_DUMP). */
+    const bool  dump     = dump_enabled("CGIR_JIT_DUMP");
+    std::string dump_dir = dump ? dump_make_dir("CGIR_JIT_DUMP", "jit") : std::string();
+
+    /* parse the program's IR/bitcode into its own context */
+    auto ctx = std::make_unique<llvm::LLVMContext>();
+    std::unique_ptr<llvm::Module> mod = [&] {
+        scoped_phase_t _p("jit-parse");
+        return parse_llvmir(
+            static_cast<const char *>(prog->source.content.llvmir.raw),
+            prog->source.content.llvmir.size,
+            *ctx
+        );
+    }();
+    if (!mod) { fprintf(stderr, "jit: failed to parse program IR\n"); abort(); }
+
+    /* dump the program IR as parsed, before any transform */
+    if (dump)
+        dump_module(dump_dir, "input.ll", *mod);
+
+    /* Resolve the entry function, each step a fallback for the previous: the
+     * explicit symbol (host tasks and device kernels name their closure entry);
+     * else a fused program's __fused_wrapper(void**); else the first externally-
+     * linked definition (the task/kernel entry externalized for JIT); else the
+     * first void definition. Falling through when a named symbol is absent keeps
+     * a stale/wrong name from silently skipping the command. */
+    llvm::Function * entry = nullptr;
+    if (const char * sym = prog->source.content.llvmir.symbol)
+        entry = mod->getFunction(sym);
+    if (entry == nullptr || entry->isDeclaration())
+        if (llvm::Function * w = mod->getFunction("__fused_wrapper"); w && !w->isDeclaration())
+            entry = w;
+    if (entry == nullptr || entry->isDeclaration())
+    {
+        entry = nullptr;
+        for (llvm::Function & F : *mod)
+            if (!F.isDeclaration() && F.hasExternalLinkage())
+            {
+                entry = &F;
+                break ;
+            }
+        if (entry == nullptr)
+            entry = find_kernel(*mod);
+    }
+
+    /* Skip (do not abort) commands whose entry is not externally JIT-resolvable
+     * - e.g. a not-yet-externalized internal task body, or a fixed-launcher
+     * command that carries a source but is not a JIT target. Leaves the
+     * launcher untouched. A nanos6 outline is exempt from the local-linkage
+     * check: an unfused (single-instance) outline may be internal in its module
+     * and is JIT'd by wrapping it in an external __fused_wrapper below. */
+    const bool proto_is_nanos6 =
+        (prog->source.content.llvmir.proto == CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE);
+    if (entry == nullptr || entry->isDeclaration() ||
+        (entry->hasLocalLinkage() && !proto_is_nanos6))
+        return ;
+
+    /* Device (GPU) miss: emit the (fused) device kernel to PTX for the device's
+     * triple/arch, cache it (in-process + on-disk), and store it back in the
+     * source; the driver JIT-loads it (cuModuleLoadData) and resolves the entry
+     * (source.symbol) at launch. The fast path above already handled cache hits. */
+    if (is_device)
+    {
+        /* Opt-in: assume the kernel's pointer parameters do not overlap.
+         *
+         * This is the one place the device JIT can beat the ahead-of-time
+         * toolchain on code quality. NVPTX lowers a load through a kernel
+         * parameter to `ld.global.nc` (the read-only data path) only when the
+         * parameter is BOTH readonly and noalias -- `readonly` the optimizer
+         * infers on its own, `noalias` it cannot, because an `omp target`'s
+         * mapped list items are not required to be distinct objects. The
+         * compiler must therefore give up on it; a runtime that knows which
+         * buffers a task actually touches does not have to. prog-fuse already
+         * makes exactly this assumption for the pointers it captures into a
+         * fused wrapper (command_graph_prog_fuse_llvmir, "distinct captured
+         * pointers are assumed non-overlapping").
+         *
+         * Off by default because it is an assumption about the program, not a
+         * deduction: enable it only when the mapped buffers of a target region
+         * are known to be disjoint. */
+        if (device_assume_noalias_params())
+        {
+            unsigned marked = 0;
+            for (llvm::Argument & A : entry->args())
+                if (A.getType()->isPointerTy() && !A.hasNoAliasAttr())
+                {
+                    A.addAttr(llvm::Attribute::NoAlias);
+                    ++marked;
+                }
+            if (marked && dump)
+                fprintf(stderr, "jit(device): assuming %u pointer parameters of `%s` do not alias\n",
+                        marked, entry->getName().str().c_str());
+        }
+
+        /* Tell the PTX assembler how densely this kernel is actually going to be
+         * co-scheduled, so it stops guessing.
+         *
+         * ptxas sizes the register budget from an occupancy target, and with only
+         * `.maxntid` to go on its target is full occupancy -- so for a 512-thread
+         * kernel on a 2048-thread SM it aims at 4 blocks and hands out exactly
+         * 65536/2048 = 32 registers per thread. That is the right trade for a
+         * latency-bound kernel and the wrong one for a bandwidth-bound kernel,
+         * which cannot use the extra warps and would rather have the registers
+         * for memory-level parallelism. The ahead-of-time toolchain never has to
+         * make the guess: it assembles relocatable (`ptxas -c`, forced by
+         * -fopenmp-relocatable-target), and a relocatable unit has no launch
+         * configuration to optimize against, so the allocator runs unconstrained.
+         * Measured on Krylov CG's SpMV, on identical PTX: 32 registers
+         * whole-program, 50 relocatable, and the 18-register difference is a 16%
+         * kernel-time difference at the same achieved occupancy.
+         *
+         * A JIT does not have to guess either, and does not have to arrive at the
+         * answer by accident: `blocks_per_sm` is the occupancy the runtime
+         * measured on this very program (see command_prog_t::blocks_per_sm), so
+         * declare it. `.minnctapersm N` raises the budget to 65536/(N*threads),
+         * which the allocator then uses or not as it sees fit -- on the same SpMV
+         * it lands on 50 with no spills, i.e. exactly the relocatable result.
+         *
+         * Declaring it is also what makes the driver-side occupancy guard a
+         * no-op rather than a repair: the kernel comes out register-limited to
+         * the recorded occupancy on its own, so nothing has to be clawed back
+         * afterwards with a shared-memory carveout or ballast.
+         *
+         * Zero means the runtime could not measure it -- leave ptxas alone. Note
+         * the value is an occupancy *floor*: too large a value tightens the
+         * budget instead of relaxing it and can force spills, so a runtime that
+         * cannot bound it against the device's threads-per-SM should pass 0 or
+         * turn this off. */
+        if (device_declare_min_ctas_per_sm() && prog->blocks_per_sm > 0 &&
+            !entry->hasFnAttribute("nvvm.minctasm"))
+        {
+            entry->addFnAttr("nvvm.minctasm", llvm::utostr(prog->blocks_per_sm));
+            if (dump)
+                fprintf(stderr, "jit(device): `%s` declared at %u blocks/SM (.minnctapersm)\n",
+                        entry->getName().str().c_str(), prog->blocks_per_sm);
+        }
+
+        const char * dtriple = prog->source.content.llvmir.triple;
+        std::string perr;
+        std::string ptx = emit_device_ptx(*mod, dtriple,
+                                          prog->source.content.llvmir.arch,
+                                          prog->source.content.llvmir.device_libs,
+                                          prog->source.content.llvmir.device_libs_count,
+                                          dump ? dump_dir : std::string(), perr);
+        if (ptx.empty())
+        {
+            fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
+            abort();
+        }
+        cache_device_put(key, ptx);
+        if (dump)
+        {
+            std::string path = dump_dir + "/final.ptx";
+            std::error_code ec;
+            llvm::raw_fd_ostream f(path, ec, llvm::sys::fs::OF_Text);
+            if (!ec) f << ptx;
+        }
+        restore_device_ptx(prog, ptx);
+        if (profiling_stats_on()) profiling_cache_event(true, 0);
+        return ;
+    }
+
+    /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
+     * packed body, `void(void*, size_t)` (PACKED). If the entry already has one
+     * of those shapes, use it directly; otherwise synthesize a void(void**)
+     * wrapper that unpacks the argument slots and calls the entry.
+     *
+     * Which shape it is must come from the declared proto, not from the
+     * signature alone: under opaque pointers a leaf taking a single captured
+     * pointer -- `void kernel(double * A)`, proto UNPACKED_PARAMS -- has exactly
+     * the shape of `void kernel(void ** args)`, and calling it directly would
+     * hand it the slot array instead of `*(double **) args[0]`.
+     *
+     * UNPACKED_PARAMS is also the default enumerator, so it doubles as "the
+     * producer said nothing". A parameter table disambiguates the two: when one
+     * is present the program really is a leaf and always gets a wrapper; without
+     * it we fall back to the signature, which is what producers that fill in
+     * nothing have always relied on. */
+    llvm::FunctionType * efty = entry->getFunctionType();
+    std::string lookup_name;
+    const auto   proto        = prog->source.content.llvmir.proto;
+    const bool   proto_unset  = (proto == CGIR_COMMAND_PROG_SOURCE_PROTO_UNPACKED_PARAMS &&
+                                 prog->source.content.llvmir.param_count == 0);
+    const bool entry_is_nanos6 = proto_is_nanos6;
+    const bool entry_is_packed = (proto == CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER) ||
+                                 (proto_unset && is_void_ptr_size(efty));
+    const bool entry_is_ptrptr = (proto == CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR) ||
+                                 (proto_unset && is_void_voidptr(efty));
+    if (entry_is_nanos6)
+    {
+        /* nanos6 outline chain: the runtime launches it as
+         *   void(void** args_v, void** dev_v, void** transl_v).
+         * A fused chain (>= 2) already exposes that 3-array __fused_wrapper; a
+         * standalone (unfused, single-instance) outline is the raw
+         * void(args, dev, translation) body, so wrap it in a 1-instance
+         * __fused_wrapper here for a uniform launch ABI. Both `void(void**,...)`
+         * and `void(void*,...)` have the same opaque-pointer type, so we
+         * distinguish the fused wrapper by its name. */
+        if (entry->getName() == "__fused_wrapper" && is_void_ptr_ptr_ptr(efty))
+        {
+            lookup_name = entry->getName().str();
+        }
+        else
+        {
+            llvm::LLVMContext & C = mod->getContext();
+            llvm::Type * void_ty = llvm::Type::getVoidTy(C);
+            llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(C);
+            llvm::Type * i64_ty  = llvm::Type::getInt64Ty(C);
+
+            llvm::FunctionType * wfty = llvm::FunctionType::get(
+                void_ty, { ptr_ty, ptr_ty, ptr_ty }, false);
+            llvm::Function * wrapper = llvm::Function::Create(
+                wfty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod.get());
+            llvm::BasicBlock * bb = llvm::BasicBlock::Create(C, "entry", wrapper);
+            llvm::IRBuilder<> b(bb);
+            auto load0 = [&] (llvm::Value * base) -> llvm::Value *
+            {
+                llvm::Value * p = b.CreateGEP(
+                    ptr_ty, base, llvm::ConstantInt::get(i64_ty, 0), "slot");
+                return b.CreateLoad(ptr_ty, p, "inst");
+            };
+            b.CreateCall(efty, entry,
+                { load0(wrapper->getArg(0)), load0(wrapper->getArg(1)), load0(wrapper->getArg(2)) });
+            b.CreateRetVoid();
+            lookup_name = "__fused_wrapper";
+        }
+    }
+    else if (entry_is_ptrptr || entry_is_packed)
+    {
+        lookup_name = entry->getName().str();
+    }
+    else
+    {
+        llvm::LLVMContext & C = mod->getContext();
+        llvm::Type * void_ty = llvm::Type::getVoidTy(C);
+        llvm::Type * ptr_ty  = llvm::PointerType::getUnqual(C);
+
+        llvm::FunctionType * wfty = llvm::FunctionType::get(void_ty, { ptr_ty }, false);
+        llvm::Function * wrapper = llvm::Function::Create(
+            wfty, llvm::GlobalValue::ExternalLinkage, "__cgir_jit_wrapper", mod.get());
+
+        /* The slot array is the runtime's own, distinct from every buffer the
+         * body touches (same assumption the fuse pass makes of its wrapper). It
+         * is what frees the loads below to be hoisted and CSE'd instead of being
+         * re-read after every store the body performs. */
+        wrapper->addParamAttr(0, llvm::Attribute::NoAlias);
+        wrapper->addParamAttr(0, llvm::Attribute::ReadOnly);
+
+        llvm::BasicBlock * bb = llvm::BasicBlock::Create(C, "entry", wrapper);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value * args_ptr = wrapper->getArg(0);
+
+        std::vector<llvm::Value *> call_args;
+        call_args.reserve(efty->getNumParams());
+        for (unsigned k = 0 ; k < efty->getNumParams() ; ++k)
+            call_args.push_back(emit_load_arg(b, args_ptr, k, efty->getParamType(k)));
+        llvm::CallInst * call = b.CreateCall(efty, entry, call_args);
+        b.CreateRetVoid();
+
+        /* Inline it here rather than hoping the cost model does: the wrapper
+         * exists only to unpack, and leaving the call in place would both keep a
+         * real call on every task launch and hide the now-known argument values
+         * from the body. The fuse pass inlines its constituents for the same
+         * reason. */
+        llvm::InlineFunctionInfo ifi;
+        llvm::InlineResult ires = llvm::InlineFunction(*call, ifi);
+        if (!ires.isSuccess())
+            fprintf(stderr, "jit: could not inline `%s` into its argument-unpacking "
+                            "wrapper (%s); leaving the call in place\n",
+                    entry->getName().str().c_str(), ires.getFailureReason());
+
+        lookup_name = "__cgir_jit_wrapper";
+    }
+
+    auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!jtmb)
+    {
+        llvm::logAllUnhandledErrors(jtmb.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: failed to detect host JIT target machine\n");
+        abort();
+    }
+
+    /* Code model. JIT'd code maps in a fresh region that can be far from the
+     * process objects this program binds to (externalized globals as absolute
+     * symbols, libc, ...), further than a PC-relative branch or page-relative
+     * address can reach -- which is why this used to compile everything with the
+     * LARGE model. That is a heavy price to pay everywhere for a few far
+     * references: on AArch64 the large model materializes *every* global,
+     * constant-pool entry and block address with a 4-instruction MOVZ/MOVK chain
+     * instead of ADRP+ADD, and calls out of range must go through a register.
+     *
+     * The distance problem is the linker's to solve, and ORC's JITLink already
+     * does: it builds GOT and PLT tables for the references that need them and
+     * relaxes the ones that do not, so only genuinely far symbols pay. LLJIT
+     * therefore *wants* Small + PIC (see its JITLink auto-configuration) and only
+     * refrains because a code model is already set here. So set the one it wants
+     * -- on the builder, since the object below is compiled by a TargetMachine
+     * made from it, not by LLJIT's own.
+     *
+     * `CGIR_JIT_HOST_CODE_MODEL=large` restores the old behaviour, for a platform
+     * where LLJIT falls back to RuntimeDyld rather than JITLink. */
+    if (strcmp(env_str("CGIR_JIT_HOST_CODE_MODEL", "small"), "large") == 0)
+        jtmb->setCodeModel(llvm::CodeModel::Large);
+    else
+    {
+        jtmb->setCodeModel(llvm::CodeModel::Small);
+        jtmb->setRelocationModel(llvm::Reloc::PIC_);
+    }
+
+    /* Codegen at the same level as the IR pipeline (O3), as the device and fuse
+     * paths do; JITTargetMachineBuilder otherwise defaults to O2. */
+    jtmb->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
+
+    /* JITTargetMachineBuilder's constructor turns emulated TLS on. That would
+     * lower every `thread_local` access in a JIT'd body to an
+     * __emutls_get_address call instead of a thread-pointer-relative access --
+     * and, worse, to a *different* storage than the process uses for the same
+     * variable. We link against the running process, so use its TLS model. */
+    jtmb->getOptions().EmulatedTLS = false;
+
+    /* Compile for the machine we are running on rather than the one the
+     * application was built for. The machine's identity is part of the cache key
+     * (jit_host_salt in jit-support.cc), so an object compiled for one machine is
+     * never reused on another. */
+    stamp_host_target_attrs(*mod);
+
+    /* Parsed IR may omit the triple (the fuse pass stamps it for the same
+     * reason): without it TargetLibraryInfo is built for an unknown triple, so
+     * the optimizer does not know which libcalls exist. */
+    if (mod->getTargetTriple().empty())
+        mod->setTargetTriple(jtmb->getTargetTriple());
+
+    /* Obtain the relocatable object for `lookup_name`: reuse it from the on-disk
+     * cache if a prior run compiled this exact body (skips optimize + codegen),
+     * else optimize + emit it and cache it. ORC's SimpleCompiler emits the object
+     * via the same addPassesToEmitFile, so a self-emitted object loads identically
+     * through addObjectFile -- externs/libc are bound at link time either way. */
+    std::string obj;
+    const bool obj_from_disk = cache_host_get_obj(key, obj);
+    if (!obj_from_disk)
+    {
+        auto otm = jtmb->createTargetMachine();
+        if (!otm)
+        {
+            llvm::logAllUnhandledErrors(otm.takeError(), llvm::errs(), "jit: ");
+            fprintf(stderr, "jit: failed to create host target machine\n");
+            abort();
+        }
+        /* likewise for the layout: the default one has the wrong ABI alignments
+         * and no native integer widths, which both mislays structs/allocas and
+         * degrades what InstCombine and the vectorizer will do */
+        if (mod->getDataLayout().isDefault())
+            mod->setDataLayout(otm->get()->createDataLayout());
+        {
+            scoped_phase_t _p("host-optimize");
+            optimize_host_module(*mod, otm->get(), lookup_name);
+        }
+        if (dump)
+            dump_module(dump_dir, "final.ll", *mod);
+        {
+            scoped_phase_t _p("host-codegen");
+            llvm::SmallString<0> objbuf;
+            llvm::raw_svector_ostream os(objbuf);
+            llvm::legacy::PassManager pm;
+            if (otm->get()->addPassesToEmitFile(pm, os, /* DwoOut */ nullptr,
+                                                llvm::CodeGenFileType::ObjectFile))
+            { fprintf(stderr, "jit: host object emission not supported\n"); abort(); }
+            pm.run(*mod);
+            obj.assign(objbuf.begin(), objbuf.end());
+        }
+        cache_host_put_obj(key, obj);
+    }
+
+    /* Load the object into a fresh LLJIT, bind the program's symbols, resolve the
+     * entry. addObjectFile skips IR codegen (the object is already compiled). */
+    auto jit_exp = [&] {
+        scoped_phase_t _p("host-orc-create");
+        return llvm::orc::LLJITBuilder()
+            .setJITTargetMachineBuilder(std::move(*jtmb))
+            .create();
+    }();
+    if (!jit_exp)
+    {
+        llvm::logAllUnhandledErrors(jit_exp.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: failed to create LLJIT\n");
+        abort();
+    }
+    std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jit_exp);
+
+    setup_host_jit_symbols(*jit, prog);
+
+    auto sym = [&] {
+        scoped_phase_t _p("host-link");
+        if (auto err = jit->addObjectFile(llvm::MemoryBuffer::getMemBufferCopy(obj)))
+        {
+            llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "jit: ");
+            fprintf(stderr, "jit: failed to add object to LLJIT\n");
+            abort();
+        }
+        return jit->lookup(lookup_name);
+    }();
+    if (!sym)
+    {
+        llvm::logAllUnhandledErrors(sym.takeError(), llvm::errs(), "jit: ");
+        fprintf(stderr, "jit: could not resolve '%s' after JIT\n", lookup_name.c_str());
+        abort();
+    }
+    /* keep the JIT (hence the compiled code) alive for the process lifetime */
+    void * fn_addr = reinterpret_cast<void *>(static_cast<uintptr_t>(sym->getValue()));
+    jit.release();
+
+    /* Cache the compiled function (+ prototype) for further instances of this
+     * construct, record the outcome, and install it. A nanos6 outline chain
+     * launches as fn(args_v, dev_v, transl_v); a packed entry as fn(args, size);
+     * anything else as a uniform void(void**) VARIADIC over prog->args. */
+    const int proto_to_use = entry_is_nanos6 ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
+                           : entry_is_packed ? (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+                                      : (int) CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC;
+    cache_host_put_fn(key, proto_to_use, fn_addr);
+    if (profiling_stats_on()) profiling_cache_event(false, obj_from_disk ? 1 : 0);
+    install_host_jit_result(prog, fn_addr, entry_is_nanos6, entry_is_packed);
     # endif /* CGIR_SUPPORT_LLVM */
 }

@@ -84,7 +84,19 @@ typedef enum    cgir_command_prog_source_proto_t
 
     /* void kernel(void * args, size_t args_size): a packed byte buffer (leading
      * by-reference pointers, then inline by-value copies). */
-    CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
+    CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER,
+
+    /* void kernel(void * args, void * device_env, void * translation): a nanos6
+     * (NODES/OmpSs-2) task outline. The three pointers are, per task instance:
+     * the packed args block, the device environment (or loop bounds), and the
+     * dependency translation table. The prog-fuse pass fuses a chain of such
+     * outlines at the program level -- the fused entry
+     * `void __fused_wrapper(void ** args_v, void ** dev_v, void ** transl_v)`
+     * calls each constituent outline i with (args_v[i], dev_v[i], transl_v[i])
+     * -- and relies on the O3 pipeline to inline the outlines and fuse their
+     * loops. Unlike the leaf/packed protos it does NOT deduplicate captured
+     * values (no per-slot args are consumed). */
+    CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE
 
 }               cgir_command_prog_source_proto_t;
 
@@ -170,12 +182,13 @@ typedef struct  cgir_command_prog_source_t
             const char * triple;
             const char * arch;
 
-            /* Optional extra bitcode module linked into the device program before
-             * codegen (see emit_device_ptx). Resolves externs `raw` references but
-             * does not define -- e.g. a device runtime library. CGIR is agnostic to
-             * its contents; the producer (which knows the toolchain layout) supplies
-             * the path. NULL => nothing extra to link. Non-owning (stable string). */
-            const char * runtime_bc;
+            /* Extra bitcode modules linked into the device program before codegen
+             * (see emit_device_ptx), in order: they define externs `raw` references
+             * -- e.g. a device runtime and a math library. CGIR is agnostic to their
+             * contents; the producer (which knows the toolchain layout) supplies the
+             * paths. NULL/0 => nothing extra to link. Non-owning (stable array/strings). */
+            const char * const * device_libs;
+            size_t               device_libs_count;
 
             /* prototype (ABI) of the entry function within `raw` (see enum). */
             cgir_command_prog_source_proto_t proto;

@@ -56,17 +56,16 @@ CGIR_NAMESPACE_BEGIN
  *
  * IMPORTANT: the declaration order below IS the canonical pipeline order. When a
  * set of passes is requested at once (command_graph_t::optimize(command_graph_pass_set_t)),
- * enabled passes are applied in this order. Keep reductions before batching, and
- * batching last. */
-# define CGIR_FORALL_COMMAND_GRAPH_PASS(F)                                                                       \
-    F(COMMAND_GRAPH_PASS_COPY_NORMALIZE,    pass_copy_normalize,    "copy-normalize",   create_copy_normalize_pass) \
-    F(COMMAND_GRAPH_PASS_COPY_FUSE,         pass_copy_fuse,         "copy-fuse",        create_copy_fuse_pass)      \
-    F(COMMAND_GRAPH_PASS_REDUCE_NODE,       pass_reduce_node,       "reduce-node",      create_reduce_node_pass)    \
-    F(COMMAND_GRAPH_PASS_REDUCE_EDGE,       pass_reduce_edge,       "reduce-edge",      create_reduce_edge_pass)    \
-    F(COMMAND_GRAPH_PASS_PROG_FUSE,         pass_prog_fuse,         "prog-fuse",        create_prog_fuse_pass)      \
-    F(COMMAND_GRAPH_PASS_JIT,               pass_jit,               "jit",              create_jit_pass)            \
-    F(COMMAND_GRAPH_PASS_SEQUENCE,          pass_sequence,          "sequence",         create_sequence_pass)       \
-    F(COMMAND_GRAPH_PASS_BATCH,             pass_batch,             "batch",            create_batch_pass)
+ * enabled passes are applied in this order. Keep reductions before packing, and
+ * packing last. */
+# define CGIR_FORALL_COMMAND_GRAPH_PASS(F)                                                                                              \
+    F(COMMAND_GRAPH_PASS_COPY_FUSE,             pass_copy_fuse,             "copy-fuse",            create_copy_fuse_pass)              \
+    F(COMMAND_GRAPH_PASS_REDUCE_NODE,           pass_reduce_node,           "reduce-node",          create_reduce_node_pass)            \
+    F(COMMAND_GRAPH_PASS_TRANSITIVE_REDUCTION,  pass_transitive_reduction,  "transitive-reduction", create_transitive_reduction_pass)   \
+    F(COMMAND_GRAPH_PASS_PROG_FUSE,             pass_prog_fuse,             "prog-fuse",            create_prog_fuse_pass)              \
+    F(COMMAND_GRAPH_PASS_JIT,                   pass_jit,                   "jit",                  create_jit_pass)                    \
+    F(COMMAND_GRAPH_PASS_SEQUENCE,              pass_sequence,              "sequence",             create_sequence_pass)               \
+    F(COMMAND_GRAPH_PASS_PACK,                  pass_pack,                  "pack",                 create_pack_pass)
 
 enum command_graph_pass_t
 {
@@ -122,9 +121,78 @@ command_graph_pass_from_str(const char * s)
     return COMMAND_GRAPH_PASS_MAX;
 }
 
+/* Parse a comma/space/tab-separated list of pass names into a set, e.g.
+ * "reduce-node,transitive-reduction,jit". A "none" token contributes nothing, so
+ * both "" and "none" yield the empty set. An unknown token is skipped; when
+ * `unknown` is non-NULL the first one is copied into it (NUL-terminated, at most
+ * `unknown_size` bytes) so the caller can report it with its own logger.
+ *
+ * Tokenizes in place over the caller's buffer without allocating, so it is usable
+ * from a runtime's start-up path. */
+static inline command_graph_pass_set_t
+command_graph_pass_set_from_str(const char * s, char * unknown, size_t unknown_size)
+{
+    if (unknown && unknown_size)
+        unknown[0] = 0;
+    if (s == NULL)
+        return 0;
+
+    /* Newline and carriage return are separators too: a value assembled by a
+     * script can pick one up (a shell line continuation inside single quotes is a
+     * literal backslash-newline), and treating it as part of a token turns a
+     * valid pass name into an unknown one -- silently running a different
+     * pipeline than the caller asked for. */
+    # define CGIR_PASS_IS_SEP(C) ((C) == ',' || (C) == ' ' || (C) == '\t' \
+                              || (C) == '\n' || (C) == '\r')
+
+    command_graph_pass_set_t passes = 0;
+    for (const char * p = s ; *p ; )
+    {
+        /* skip separators */
+        if (CGIR_PASS_IS_SEP(*p))
+        {
+            ++p;
+            continue;
+        }
+
+        /* [p..q[ is the token */
+        const char * q = p;
+        while (*q && !CGIR_PASS_IS_SEP(*q))
+            ++q;
+
+        const size_t len = (size_t) (q - p);
+        char tok[64];
+        if (len < sizeof(tok))
+        {
+            memcpy(tok, p, len);
+            tok[len] = 0;
+
+            if (strcmp(tok, "none"))
+            {
+                const command_graph_pass_t pass = command_graph_pass_from_str(tok);
+                if (pass == COMMAND_GRAPH_PASS_MAX)
+                {
+                    /* only the first unknown token is reported */
+                    if (unknown && unknown_size && unknown[0] == 0)
+                    {
+                        const size_t n = (len < unknown_size - 1) ? len : unknown_size - 1;
+                        memcpy(unknown, p, n);
+                        unknown[n] = 0;
+                    }
+                }
+                else
+                    passes |= command_graph_pass_bit(pass);
+            }
+        }
+        p = q;
+    }
+    # undef CGIR_PASS_IS_SEP
+    return passes;
+}
+
 /* A comma-separated list of every pass name, with a trailing ", " separator,
  * built at compile time from CGIR_FORALL_COMMAND_GRAPH_PASS, e.g.
- * "copy-normalize, copy-fuse, reduce-node, reduce-edge, prog-fuse, batch, ".
+ * "copy-fuse, reduce-node, transitive-reduction, prog-fuse, jit, sequence, pack, ".
  * The trailing separator lets a caller append a final token (such as "none")
  * without special-casing. Handy for diagnostics that enumerate valid pass names.
  *

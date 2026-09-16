@@ -44,6 +44,7 @@
 # include <cgir/namespace.hpp>
 
 # include <algorithm>
+# include <atomic>
 # include <functional>
 # include <list>
 # include <queue>
@@ -76,8 +77,24 @@ void command_graph_optimize(command_graph_t * cg, command_graph_pass_t pass);
 /* Integer type to use for indexing command graph nodes */
 typedef size_t command_graph_node_index_t;
 
-/* Integer type to use for walk ids */
-typedef int8_t command_graph_walk_id_t;
+/* Integer type to use for walk ids.
+ *
+ * A walk marks a node visited by stamping it with the id of the walk in
+ * progress. The id must therefore be unique among all walks a node can ever
+ * take part in -- and a node takes part in the walks of every graph that can
+ * reach it, not just of the one that allocated it: the `sequence` and `pack`
+ * passes build sub-graphs that REUSE the parent's nodes. A per-graph counter
+ * would restart at zero in each fresh sub-graph and re-issue ids that its
+ * shared nodes still carry from the parent's last walk, which reads as
+ * "already visited" and silently truncates the traversal.
+ *
+ * So the counter is process-wide (command_graph_walk_id_next), and 64 bits
+ * wide so it cannot wrap back onto a live id. 0 is never issued and is the
+ * value a fresh node starts at. */
+typedef uint64_t command_graph_walk_id_t;
+
+/* Issues the stamp for one walk. Incremented once per walk, not per node. */
+extern std::atomic<command_graph_walk_id_t> command_graph_walk_id_next;
 
 enum command_graph_walk_search_t
 {
@@ -100,8 +117,8 @@ enum command_graph_contraction_hint_t
     /* u,v are a sequence u -> v, with
      *  - 'u' having a single successor   (v)
      *  - 'v' having a single predecessor (u) */
-    COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE = (1 << 1),
-    COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE = (1 << 2),
+    COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL = (1 << 1),
+    COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL = (1 << 2),
 
     /* Contract {u,v} in place to that u := u (+) v, return u.
      * Else, return a new node w != u */
@@ -309,15 +326,12 @@ struct command_graph_t
     command_graph_node_t * entry;
     command_graph_node_t * exit;
 
-    /* dfs id */
-    command_graph_walk_id_t walk_id;
-
     /* true iff this graph is a linear chain (A -> B -> ... -> Z) of PROG
      * commands whose launch mode is TASK_SPAWN (i.e. a sequence of OpenMP
-     * tasks). Set by the batch pass on a batch's sub-graph; lets the runtime
+     * tasks). Set by the pack pass on a pack's sub-graph; lets the runtime
      * replay the whole graph as a single "super" task instead of one task per
      * command. */
-    bool is_sequence = false;
+    bool is_serial = false;
 
     /** Methods to allocate command, nodes and graphs */
     command_constructor_t command_new;
@@ -362,8 +376,7 @@ struct command_graph_t
             assert(this->exit);
             this->entry->precedes(this->exit);
         }
-        this->walk_id = 0;
-        this->is_sequence = false;
+        this->is_serial = false;
     }
 
     /* coherence checks */
@@ -458,7 +471,7 @@ struct command_graph_t
     }
 
     inline bool
-    are_sequence(
+    are_serial(
         command_graph_node_t * u,
         command_graph_node_t * v
     ) {
@@ -496,8 +509,8 @@ struct command_graph_t
      *
      *  You may provide these if the nodes {u,v} matches
      *      - COMMAND_GRAPH_CONTRACTION_HINT_FALSE_TWINS    u    v
-     *      - COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE   u -> v
-     *      - COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE   v -> u
+     *      - COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL   u -> v
+     *      - COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL   v -> u
      *
      *  You may provide
      *      - COMMAND_GRAPH_CONTRACTION_HINT_INPLACE
@@ -574,9 +587,9 @@ struct command_graph_t
             }
         }
         /* u -> v */
-        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SEQUENCE)
+        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_U_V_SERIAL)
         {
-            assert(this->are_sequence(u, v));
+            assert(this->are_serial(u, v));
             if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_INPLACE)
             {
                 /* v successors' predecessors must point to u, not v anymore */
@@ -617,9 +630,9 @@ struct command_graph_t
             }
         }
         /* v -> u */
-        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SEQUENCE)
+        else if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_V_U_SERIAL)
         {
-            assert(this->are_sequence(v, u));
+            assert(this->are_serial(v, u));
             if constexpr (hints & COMMAND_GRAPH_CONTRACTION_HINT_INPLACE)
             {
                 /* v predecessors' successors must point to u, not v anymore */
@@ -721,7 +734,10 @@ struct command_graph_t
         command_graph_node_t * node,
         std::function<void(command_graph_node_t * node)> f
     ) {
-        node->walk_id = ++this->walk_id;
+        /* one fresh id per walk, from the process-wide counter: `node` may be
+         * shared with another graph, so an id private to this one could alias
+         * a stamp that graph already left on it (see command_graph_walk_id_t) */
+        node->walk_id = ++command_graph_walk_id_next;
         node->walk<search, order>(f);
     }
 
@@ -741,7 +757,9 @@ struct command_graph_t
      * Iterators *
      *************/
 
-    template<typename T>
+    struct empty_pls_t {};
+
+    template<typename T = empty_pls_t>
     struct node_iterator_t
     {
         /* the node */
@@ -753,10 +771,10 @@ struct command_graph_t
         node_iterator_t(command_graph_node_t * node) : node(node), data() {}
     };
 
-    template <typename T,
-              bool include_entry_exit = false,
-              command_graph_walk_search_t    search    = COMMAND_GRAPH_WALK_SEARCH_DFS,
-              command_graph_walk_order_t     order     = COMMAND_GRAPH_WALK_ORDER_PRE>
+    template <bool include_entry_exit            = false,
+              typename T                         = empty_pls_t,
+              command_graph_walk_search_t search = COMMAND_GRAPH_WALK_SEARCH_DFS,
+              command_graph_walk_order_t  order  = COMMAND_GRAPH_WALK_ORDER_PRE>
     inline std::vector<node_iterator_t<T>>
     create_node_iterators(const command_graph_node_index_t initial_capacity = 2048)
     {
@@ -769,8 +787,10 @@ struct command_graph_t
             [&] (command_graph_node_t * node)
             {
                 if constexpr (!include_entry_exit)
+                {
                     if (node == this->node_get_entry() || node == this->node_get_exit())
                         return ;
+                }
                 node->iterator_index = vec.size();
                 vec.push_back(node);
             }

@@ -48,31 +48,19 @@ CGIR_NAMESPACE_USE;
 
 /*
  * SEQUENCE PASS - group maximal linear chains (u -> v -> ... -> w) of
- * same-device task nodes into COMMAND_TYPE_BATCH sub-graphs flagged
- * `is_sequence`. Such a batch is a plain sequence of OpenMP task bodies, which
+ * same-device task nodes into COMMAND_TYPE_PACK sub-graphs flagged
+ * `is_serial`. Such a pack is a plain sequence of OpenMP task bodies, which
  * the runtime replays as a single "super" task instead of one task per command
- * (see command_graph_t::is_sequence and xkrt's command_graph_replay_sequence).
- *
- * Detection is a single DFS-order scan: nodes are visited head-before-interior
- * (create_node_iterators walks a forward DFS pre-order from entry), so the first
- * node of a chain that is reached is its head. Starting there, we walk forward
- * across "sequence edges" (the current node has a single successor and that
- * successor has a single predecessor, both same-device and sequence-able) until
- * the chain ends, marking every member `contracted` so the outer scan skips the
- * chain's interior.
- *
- * Materialization is in place: the chain's external boundary is moved onto a
- * fresh top-level BATCH node, and the chain's head/tail are reused as the sub
- * command-graph's entry/exit (no extra empty control nodes), keeping the
- * internal chain edges as-is.
+ * (see command_graph_t::is_serial and xkrt's command_graph_replay_sequence).
  */
 
 /* per-node pass storage */
-struct pls_t
+struct sequence_pls_t
 {
-    bool contracted = false;   /* already absorbed into a materialized sequence */
+    bool contracted;
+    sequence_pls_t(void) : contracted(false) {}
+    ~sequence_pls_t(void) {}
 };
-using node_t = command_graph_t::node_iterator_t<pls_t>;
 
 /* A node is "sequence-able" (may belong to an OpenMP-task sequence) if it is a
  * control node, or a PROG command whose launch mode is TASK_SPAWN (a recorded
@@ -83,10 +71,10 @@ using node_t = command_graph_t::node_iterator_t<pls_t>;
       (N)->command->type == COMMAND_TYPE_PROG &&                        \
       (N)->command->prog.launch_mode == CGIR_COMMAND_PROG_LAUNCH_MODE_TASK_SPAWN))
 
-/* Contract the chain [head .. tail] into the fresh BATCH node 'B' whose
+/* Contract the chain [head .. tail] into the fresh PACK node 'B' whose
  * sub-graph is 'sub'. The chain's internal edges are left untouched; only the
  * two boundaries move onto 'B', and the sub-graph entry/exit wrap head/tail. */
-/* Move the chain's external boundary onto the batch node 'B': the head's
+/* Move the chain's external boundary onto the pack node 'B': the head's
  * predecessors and the tail's successors (all external). Leaves the head with no
  * predecessor and the tail with no successor, so they can be reused as the sub
  * command-graph's entry/exit. The internal chain edges are untouched. */
@@ -96,7 +84,7 @@ command_graph_pass_sequence_detach_boundary(
     command_graph_node_t * head,
     command_graph_node_t * tail
 ) {
-    /* head's predecessors (all external) now precede the batch node */
+    /* head's predecessors (all external) now precede the pack node */
     for (command_graph_node_t * p : head->predecessors)
     {
         auto it = std::find(p->successors.begin(), p->successors.end(), head);
@@ -109,7 +97,7 @@ command_graph_pass_sequence_detach_boundary(
     B->predecessors = std::move(head->predecessors);
     head->predecessors.clear();
 
-    /* tail's successors (all external) now succeed the batch node */
+    /* tail's successors (all external) now succeed the pack node */
     for (command_graph_node_t * s : tail->successors)
     {
         auto it = std::find(s->predecessors.begin(), s->predecessors.end(), tail);
@@ -128,7 +116,7 @@ command_graph_t::pass_sequence(void)
 {
     /* forward DFS pre-order from entry: a chain's head precedes its interior */
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit, sequence_pls_t>();
     const int n = (int) nodes.size();
     if (n <= 2)   /* only entry/exit: nothing to sequence */
         return ;
@@ -154,7 +142,7 @@ command_graph_t::pass_sequence(void)
 
         /* walk the maximal chain once: mark members contracted, count COMMANDs,
          * and remember the tail. All members share u's device (the walk requires
-         * nxt->device == cur->device at every step), so the batch device is
+         * nxt->device == cur->device at every step), so the pack device is
          * simply u->device_unique_id. */
         nodes[u->iterator_index].data.contracted = true;
         int ncmd = (u->type == COMMAND_GRAPH_NODE_TYPE_COMMAND) ? 1 : 0;
@@ -177,14 +165,12 @@ command_graph_t::pass_sequence(void)
 
         if (ncmd < 2)
             continue ;
-        /* fresh BATCH command + batch node */
+        /* fresh PACK command + pack node */
         assert(this->command_new && this->command_graph_new && this->command_graph_node_new);
-        command_t * cmd = this->command_new(this, COMMAND_TYPE_BATCH);
+        command_t * cmd = this->command_new(this, COMMAND_TYPE_PACK);
         assert(cmd);
-        cmd->batch.driver_handle = NULL;
 
-        command_graph_node_t * B =
-            this->command_graph_node_new(this, u->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
+        command_graph_node_t * B = this->command_graph_node_new(this, u->device_unique_id, COMMAND_GRAPH_NODE_TYPE_COMMAND);
         assert(B);
         B->command = cmd;
 
@@ -196,8 +182,8 @@ command_graph_t::pass_sequence(void)
          * extra empty control nodes); the internal chain edges are kept as-is */
         command_graph_t * sub = this->command_graph_new(this, u, tail);
         assert(sub);
-        cmd->batch.cg    = sub;
-        sub->is_sequence = true;
+        cmd->pack.cg    = sub;
+        sub->is_serial = true;
     }
 
 # ifndef NDEBUG

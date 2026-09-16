@@ -130,7 +130,14 @@ typedef enum   command_prog_function_prototype_t
      * buffer is command_prog_t::args and its size command_prog_t::args_size. Used
      * by JIT'd/fused programs compiled in the packed ABI and by device kernels
      * launched via the CUDA/HIP parameter-buffer form. */
-    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED,
+
+    /* launcher.nanos6.fn(args_v, dev_v, transl_v) — a fused chain of nanos6
+     * (NODES/OmpSs-2) task outlines (see CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE).
+     * The three arguments are arrays of `n_args` pointers (one entry per fused
+     * task instance): the args blocks, device environments/loop bounds, and
+     * translation tables. Produced by the jit pass from an outline chain. */
+    CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
 
 }              command_prog_function_prototype_t;
 
@@ -170,6 +177,13 @@ struct command_prog_t
         struct {
             void (*fn)(void * args, size_t args_size);
         } packed;
+
+        /* Fused chain of nanos6 (NODES/OmpSs-2) task outlines:
+         * fn(args_v, dev_v, transl_v), where each argument is an array of
+         * command_prog_t::n_args pointers (one per fused task instance). */
+        struct {
+            void (*fn)(void ** args_v, void ** dev_v, void ** transl_v);
+        } nanos6;
 
     } launcher;
 
@@ -212,6 +226,83 @@ struct command_prog_t
     struct {
         unsigned int x, y, z;
     } block;
+
+    /* Occupancy target: how many blocks (CTAs) the device may co-schedule per
+     * SM/CU. 0 = unset, let the device decide.
+     *
+     * grid and block say how much work is launched; this says how much of it the
+     * device runs at once. That is a third, independent launch parameter, and it
+     * is one a *code* transformation changes by accident: occupancy is decided by
+     * the per-block resources the compiler happened to use (registers, shared
+     * memory, barriers), so a pass that rewrites a program -- the `jit` pass
+     * recompiling it, `prog-fuse` merging several -- generally produces code the
+     * hardware co-schedules differently. That is not a neutral change: a program
+     * whose speed rests on cache reuse slows down when more of its blocks run
+     * concurrently and compete for the same cache, and the loss can be several x
+     * even when the emitted instructions are identical.
+     *
+     * So a producer records here the occupancy of the program it is about to have
+     * rewritten (in xkrt, from driver_t::f_prog_max_blocks_per_sm just before
+     * command_graph_t::optimize), and the driver holds the replacement to it --
+     * in both directions: code that is co-scheduled more densely floods the
+     * cache, code that is co-scheduled more sparsely starves the device of
+     * parallelism. Enforcement is the driver's business and must use a resource
+     * the hardware accounts *per block* -- shrinking the launch grid does not
+     * work, because other blocks (of the same program or of a concurrent one)
+     * simply take the freed slots.
+     *
+     * Two consumers, in this order:
+     *
+     *   - the `jit` pass, at codegen time, which declares it to the device
+     *     assembler (NVPTX: `.minnctapersm`). This is the one that matters: an
+     *     assembler given no occupancy target assumes the kernel wants full
+     *     occupancy and sizes the register budget for it, which for a
+     *     bandwidth-bound kernel spends registers on warps it cannot use. Told
+     *     the real target, it emits code that is *already* limited to it, and
+     *     keeps the registers. Hence the requirement that a producer fill this
+     *     in before command_graph_t::optimize, not merely before the launch.
+     *
+     *   - the driver, at first launch, as a backstop for whatever the assembler
+     *     did anyway -- and for programs whose code the JIT never saw.
+     *
+     * A backstop should be read with tolerance. The levers a driver has are coarse
+     * (a shared-memory carveout is rounded to the device's own buckets, a register
+     * cap moves residency in whole blocks), so insisting on the exact figure
+     * usually means overshooting it, and overshooting downwards does the same harm
+     * as the drift being corrected -- measured at 35% of a reduction kernel's
+     * runtime, to correct a 20% drift. xkrt enforces past a factor of 1.5 either
+     * way and otherwise leaves the program alone.
+     *
+     * A driver may clear or overwrite the field once consumed (it is a request,
+     * not a durable record). */
+    unsigned int blocks_per_sm;
+
+    /* Dynamic (per-block) shared memory to reserve at launch, in bytes. 0 = none.
+     * Both a real requirement of the program and the last-resort lever a driver
+     * has to hold it to `blocks_per_sm` when no cheaper per-block resource
+     * suffices -- shared-memory capacity bounds residency, at the cost of the L1
+     * it shares its budget with on most devices. */
+    unsigned int dyn_shmem;
+
+    /* How many blocks of THIS program the device can run at the same time, i.e.
+     * (blocks resident per SM) x (number of SMs). Filled in by the runtime, which
+     * is the only party that knows the device; 0 means "not known".
+     *
+     * It is a precondition for fusing device programs. A fused program is a
+     * single launch, so the ordering its constituents used to get from the launch
+     * boundary has to come from a barrier inside the kernel instead -- and a
+     * grid-wide barrier only completes if every block is running, because a block
+     * that has not been scheduled never arrives at it. cgir therefore fuses
+     * device programs only when `grid` fits within this, and leaves them alone
+     * when it does not or when nobody said. */
+    unsigned int max_coresident_blocks;
+
+    /* Set by prog-fuse on a program it produced from several device programs: the
+     * kernel contains a grid-wide barrier, so every block must be resident for it
+     * to make progress. A CUDA driver must launch it cooperatively
+     * (cuLaunchCooperativeKernel), which is what makes that guarantee; launching
+     * it like an ordinary kernel risks a hang. */
+    bool requires_coresident_grid;
 };
 
 /* read/write files */
@@ -225,16 +316,13 @@ struct command_file_t
 
 struct command_graph_t;
 
-/* a batch of multiple dependent commands, contracted by a driver into a single
+/* a pack of multiple dependent commands, contracted by a driver into a single
  * opaque executable (e.g. CUgraphExec on CUDA) */
-struct command_batch_t
+struct command_pack_t
 {
-    /* the command graph of that batch (its `is_sequence` flag marks a linear
+    /* the command graph of that pack (its `is_serial` flag marks a linear
      * chain of TASK_SPAWN PROG commands, see command_graph_t) */
     command_graph_t * cg;
-
-    /* driver specific handle */
-    void * driver_handle;
 };
 
 struct command_graph_node_t;
@@ -283,7 +371,7 @@ struct command_t
         command_copy_1D_t       copy_1D;
         command_copy_2D_t       copy_2D;
         command_file_t          file;
-        command_batch_t         batch;
+        command_pack_t         pack;
         command_ctrl_loop_t     loop;
         command_ctrl_demux_t    demux;
     };
@@ -304,7 +392,8 @@ struct command_t
             prog.source.content.llvmir._externs_owned = false;
             prog.source.content.llvmir.triple         = nullptr;
             prog.source.content.llvmir.arch           = nullptr;
-            prog.source.content.llvmir.runtime_bc     = nullptr;
+            prog.source.content.llvmir.device_libs       = nullptr;
+            prog.source.content.llvmir.device_libs_count = 0;
             prog.source.content.llvmir.proto          = CGIR_COMMAND_PROG_SOURCE_PROTO_UNPACKED_PARAMS;
             prog.source.content.llvmir.params         = nullptr;
             prog.source.content.llvmir.param_count    = 0;
@@ -328,6 +417,13 @@ struct command_t
              * even when a producer leaves them unset. */
             prog.grid.x  = prog.grid.y  = prog.grid.z  = 0;
             prog.block.x = prog.block.y = prog.block.z = 0;
+            prog.blocks_per_sm = 0;
+            prog.dyn_shmem     = 0;
+            /* 0 = the runtime has not told us how many blocks fit at once, which
+             * makes device fusion unsafe; false = this program has no grid-wide
+             * barrier and needs no special launch. Both are the safe defaults. */
+            prog.max_coresident_blocks   = 0;
+            prog.requires_coresident_grid = false;
         }
     }
 };

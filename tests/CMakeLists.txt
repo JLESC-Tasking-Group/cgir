@@ -7,11 +7,21 @@ project(tests)
 
 # list of tests
 set(TEST_SOURCES
-    batch.cc
+    pack.cc
+    pack-random.cc
     sequence.cc
     h2d-distribute.cc
-    prog-fuse.cc
 )
+
+# Tests that compile and run a program, so they need the LLVM-backed passes
+# (prog-fuse / jit); without USE_LLVM those abort by design.
+if (USE_LLVM)
+    list(APPEND TEST_SOURCES
+        prog-fuse.cc
+        prog-fuse-device-residency.cc
+        jit-entry-shape.cc
+    )
+endif()
 
 # Loop over each test source file
 foreach(TEST_FILE ${TEST_SOURCES})

@@ -46,6 +46,13 @@
 
 CGIR_NAMESPACE_USE;
 
+/* Process-wide, so that a walk id is unique across every graph that can reach
+ * a given node -- a sub-graph built by `sequence` or `pack` shares its nodes
+ * with its parent. Bumped once per walk, so the atomic is never contended by
+ * the traversal itself. See command_graph_walk_id_t. */
+std::atomic<CGIR_NAMESPACE::command_graph_walk_id_t>
+CGIR_NAMESPACE::command_graph_walk_id_next{0};
+
 ///////////
 //  DUMP //
 ///////////
@@ -56,10 +63,8 @@ command_graph_dump_interior(
     FILE * f
 ) {
     // Check that there is a unique source and sink
-    struct pls_t {};
-    using node_t = command_graph_t::node_iterator_t<pls_t>;
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = cg->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = cg->create_node_iterators<include_entry_exit>();
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
         command_graph_node_t * node = nodes[i].node;
@@ -80,13 +85,13 @@ command_graph_dump_interior(
             case (COMMAND_GRAPH_NODE_TYPE_COMMAND):
             {
                 assert(node->command);
-                if (node->command->type == COMMAND_TYPE_BATCH && node->command->batch.cg)
+                if (node->command->type == COMMAND_TYPE_PACK && node->command->pack.cg)
                 {
                     fprintf(f, "  subgraph cluster_%p {\n", node);
                     fprintf(f, "    \"%p\" [style=invis, width=0, height=0, label=\"\"] ;\n", node);
                     fprintf(f, "    label=\"node %lu\\ndev=%u\\ncmd=%s\" ;\n",
                             node->iterator_index, node->device_unique_id, command_type_to_str(node->command->type));
-                    command_graph_dump_interior(node->command->batch.cg, f);
+                    command_graph_dump_interior(node->command->pack.cg, f);
                     fprintf(f, "  }\n");
                 }
                 else
@@ -107,9 +112,9 @@ command_graph_dump_interior(
         node->foreach_successor([&] (command_graph_node_t * succ)
         {
             fprintf(f, "  \"%p\" -> \"%p\"", node, succ);
-            if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && node->command->type == COMMAND_TYPE_BATCH)
+            if (node->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && node->command->type == COMMAND_TYPE_PACK)
                 fprintf(f, " [ltail=cluster_%p]", node);
-            if (succ->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && succ->command->type == COMMAND_TYPE_BATCH)
+            if (succ->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && succ->command->type == COMMAND_TYPE_PACK)
                 fprintf(f, " [lhead=cluster_%p]", succ);
             fprintf(f, " ;\n");
         });
@@ -143,14 +148,11 @@ command_graph_t::coherence_checks(void)
     assert( exit->successors.size()   == 0);
 
     // Check that there is a unique source and sink
-    struct pls_t {};
-    using node_t = command_graph_t::node_iterator_t<pls_t>;
     constexpr bool include_entry_exit = true;
-    std::vector<node_t> nodes = this->create_node_iterators<pls_t, include_entry_exit>();
+    auto nodes = this->create_node_iterators<include_entry_exit>();
     for (command_graph_node_index_t i = 0 ; i < nodes.size() ; ++i)
     {
-        node_t & node = nodes[i];
-        command_graph_node_t * u = node.node;
+        command_graph_node_t * u = nodes[i].node;
         assert(u);
         assert(u == this->node_get_entry() || u->predecessors.size());
         assert(u == this->node_get_exit()  || u->successors.size());
