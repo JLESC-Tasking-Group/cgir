@@ -33,125 +33,26 @@ make
 
 # Runtime Configuration
 You may set the following environment variables
-- `CGIR_OPTIMIZER` as `mlir` or `pod` to switch the optimizer representation.
-- `CGIR_JIT_DUMP` to dump the LLVM IR before and after JIT passes.
-- `CGIR_PROG_FUSE_DUMP` to dump the LLVM IR of each prog-fusion for debugging:
-  the input programs (`input-<i>.ll`), the merged module before optimization
-  (`merged.ll`) and the fused/optimized result (`fused.ll`). Set it to any
-  non-empty value other than `0` to write under `~/.cgir/tmp/prog-fuse-<seq>/`,
-  or to an absolute path to override the output directory.
-- `CGIR_OPTIMIZE_DUMP` to dump the command graph as Graphviz `.dot` before and
-  after every optimization pass (works for both the legacy and the `mlir`
-  optimizer). Each pass writes `optimize-<seq>-<pass>-before.dot` and
-  `optimize-<seq>-<pass>-after.dot`, where `<seq>` increments per pass so the
-  files form the timeline of an `optimize()` call. Set it to any non-empty value
-  other than `0` to write under `~/.cgir/tmp/`, or to an absolute path to
-  override the output directory. Render a dump with e.g.
-  `dot -Tpng optimize-0-copy-fuse-after.dot -o after.png`.
-- `CGIR_STATS_CSV` to append one machine-readable CSV row per optimization pass,
-  recording the pass wall-clock time and the command-graph node/edge and
-  per-command-type counts *before* and *after* the pass (nodes, edges, empty
-  control nodes, commands, PROG, 1D/2D copies, batches). Set it to a file path;
-  rows accumulate across passes and processes. This is the data source for the
-  evaluation harness (`apps/openmp/scripts/`). Independent of `CGIR_OPTIMIZE_DUMP`.
-- `CGIR_STATS_TAG` an arbitrary string written verbatim in the `tag` column of
-  every `CGIR_STATS_CSV` row, so a caller (e.g. the benchmark runner) can join
-  the per-pass stats back to a specific run.
+- `CGIR_OPTIMIZER=[mlir|pod]` to switch the optimizer representation.
+- `CGIR_JIT_DUMP=[0|1]` to dump the LLVM IR before and after JIT passes.
+- `CGIR_PROG_FUSE_DUMP=[0|1]` to dump the LLVM IR of each prog-fusion for debugging, to `~/.cgir/`
+- `CGIR_OPTIMIZE_DUMP=[0|1]` to dump the CGIR graph as Graphviz `.dot` before and after every optimization pass.
+- `CGIR_STATS_CSV=[/path/to/csv/file]` to append stats of individual optimization passes to the given CSV file.
+- `CGIR_STATS_TAG` an arbitrary string written verbatim in the `tag` column of every `CGIR_STATS_CSV` row.
 
 JIT compilation caching and profiling (the `jit` pass compiles each program's
 LLVM IR to a host function or device PTX):
-- `CGIR_JIT_HOST_CODE_MODEL` selects the code model for host programs: `small`
-  (default) or `large`. JIT'd code can be mapped further from the process it
-  binds to than a PC-relative branch reaches; `small` leaves that to ORC's
-  JITLink, which routes only the references that need it through a GOT/PLT,
-  whereas `large` makes *every* global reference and call pay (on AArch64, a
-  4-instruction address materialization instead of `ADRP`+`ADD`). Use `large`
-  only on a platform where LLJIT falls back to RuntimeDyld instead of JITLink.
-- `CGIR_JIT_DEVICE_NOALIAS` set to any non-empty value other than `0` makes the
-  `jit` pass assume the pointer parameters of a device kernel do not overlap.
-  This is the one place the device JIT can beat the ahead-of-time toolchain:
-  NVPTX only emits `ld.global.nc` (the read-only data path, which matters for an
-  indirect gather) for a kernel parameter that is *both* `readonly` and
-  `noalias`, and the compiler can never infer the latter because an `omp target`
-  does not require its mapped list items to be distinct objects -- whereas a
-  runtime that knows which buffers a task touches can. Off by default: it is an
-  assumption about the program, not a deduction. (`prog-fuse` already makes the
-  same assumption for the pointers it captures into a fused wrapper.)
-- `CGIR_JIT_DEVICE_MINCTASM` set to `0` stops the device JIT from declaring a
-  program's recorded occupancy (`command_prog_t::blocks_per_sm`) to the PTX
-  assembler as `.minnctapersm`. **On by default.** ptxas sizes the register
-  budget from an occupancy target, and given only `.maxntid` it assumes full
-  occupancy — for a 512-thread kernel on a 2048-thread SM that means aiming at 4
-  blocks and handing out exactly 65536/2048 = 32 registers per thread. A
-  bandwidth-bound kernel cannot use the extra warps and would rather have the
-  registers. The ahead-of-time toolchain sidesteps the guess by accident, since
-  it assembles relocatable (`ptxas -c`) and a relocatable unit has no launch
-  configuration to target; a JIT sidesteps it on purpose, because the runtime
-  measured the occupancy. On Krylov CG (GH200, n=196), identical PTX assembles
-  to 32 registers whole-program and 50 with either `-c` or `.minnctapersm 2`,
-  and those 18 registers are worth 16% of kernel time (1102 us vs 950 us) at the
-  same achieved occupancy. Declaring it also makes the driver-side occupancy
-  guard a no-op instead of a repair. The value is an occupancy *floor*: too
-  large a value tightens the budget rather than relaxing it and can force
-  spills, so a runtime that cannot bound it against the device's
-  threads-per-SM should record 0 or set this to `0`.
-- `CGIR_JIT_DEVICE_LTO` set to `0` makes the device JIT run a single per-module
-  O3 after linking the DeviceRTL, instead of the two-phase pipeline clang uses
-  under `-foffload-lto` (pre-link O3, link, post-link `lto<O3>`). **On by
-  default**, but for fidelity and compile time rather than for speed: measured
-  on Krylov CG (GH200, n=196) it is **neutral on kernel time** — it does not
-  change the register allocation, which is what that gap turned out to be about
-  (see `CGIR_JIT_DEVICE_MINCTASM`) — while being ~14% *cheaper* to JIT (0.55 s
-  vs 0.65 s for 12 programs), because simplifying before the DeviceRTL link
-  makes the post-link pipeline cheaper than the extra pre-link pass costs. It is
-  on because matching the toolchain the ahead-of-time baseline is built with is
-  the right default when no difference is measurable.
-- `CGIR_JIT_AOT_DEVICE` set to `0` makes the `jit` pass leave alone any device
-  program that still carries its ahead-of-time compiled kernel, i.e. recompile
-  only what `prog-fuse` synthesized. **On by default** — recompiling is safe and
-  pays (Krylov CG on GH200: 1.95 ms ahead-of-time vs 1.82 ms recompiled).
-  Set it to `0` on a runtime whose device driver cannot preserve a program's
-  occupancy across the substitution (see `command_prog_t::blocks_per_sm`):
-  recompiling changes the per-block resources a kernel uses, hence how many
-  blocks the hardware co-schedules, and that alone has been measured to cost 6x
-  on an unchanged instruction stream.
-- `CGIR_JIT_CACHE` gates the JIT **result cache**, which is **on by default**.
-  Set it to `0` to disable all caching (in-process and on-disk). The in-process
-  cache is content-addressed: task instances of the same construct (identical IR,
-  externs, prototype and target) reuse the already-compiled host function pointer
-  or emitted device PTX instead of recompiling. A hit is byte-identical to
-  recompiling, so it never changes generated code.
-- `CGIR_JIT_CACHE_MODE` restricts what the on-disk cache may do: `rw` (default),
-  `w` write-only, `r` read-only. The one-letter modes are for measurement. Timing
-  a first run means timing a run that compiles everything, but a run that also
-  *populates* the cache reads back what it has just written, so its later work
-  reuses its own earlier output and the "cold" figure is quietly warm. `w` fills
-  the cache without ever consulting it, so a following `rw` or `r` run measures
-  the cached case against a cache it did not influence.
-- `CGIR_JIT_CACHE_DIR` enables the **persistent on-disk cache** at the given
-  directory (opt-in; disabled unless set). It stores compiled host objects
-  (`<hash>.o`) and device PTX (`<hash>.ptx`) so a later run skips
-  optimization/codegen. Keys fold a toolchain salt (LLVM version, the cgir build
-  timestamp, the host CPU, and the device libraries' identity), so entries
-  self-invalidate on a cgir rebuild, an LLVM change, or a different CPU/target;
-  host objects rebind their external symbols per run (robust to ASLR).
-- `CGIR_JIT_TIMING` set to any non-empty value other than `0` to print, at
-  process exit, a per-phase wall-clock breakdown of JIT compilation accumulated
-  across all compiles (`jit-parse`, `host-optimize`/`host-codegen`/`host-link`,
-  device `dev-spmdize`/`dev-link-parse`/`dev-o3`/`dev-ptx-emit`, ...). The buckets
-  nest under `jit-total`.
-- `CGIR_JIT_CACHE_STATS` set to any non-empty value other than `0` to print, at
-  process exit, the JIT result-cache outcomes split host/device: total programs,
-  `compiled` (full compiles), `disk-reuse`, `mem-reuse`, and the overall reuse %.
-- `CGIR_JIT_STATS_CSV` set to a file path to append, at process exit, one
-  machine-readable row with the full JIT breakdown (mirrors `CGIR_STATS_CSV`):
-  the `tag` (`CGIR_STATS_TAG`, first column, to join back to a caller's run),
-  every timing phase as `<phase>_s`/`<phase>_n` (seconds/calls), and split
-  host/device cache counts (`{host,device}_{total,compiled,disk_reuse,mem_reuse}`).
-  The header is written when the file is new; rows accumulate across processes.
-  Enabling it also turns on the timing/cache collection (without the stderr dump);
-  a row is written only for runs that actually JIT-compiled.
-
+- `CGIR_JIT_HOST_CODE_MODEL=[small|large]` selects the LLVM's code model for host programs: `small`(default) or `large`.
+- `CGIR_JIT_DEVICE_NOALIAS=[0|1]` set to make the `jit` pass assume that pointer parameters of a device kernel do not overlap (default: 1).
+- `CGIR_JIT_DEVICE_MINCTASM=[0|1]` control either the device JIT declares recorded occupancy (`command_prog_t::blocks_per_sm`) to the PTX assembler as `.minnctapersm` (default: 1).
+- `CGIR_JIT_DEVICE_LTO=[0|1]` set to `0` makes the device JIT run a single per-module O3 after linking the DeviceRTL, instead of the two-phase pipeline clang use   under `-foffload-lto` (pre-link O3, link, post-link `lto<O3>`).
+- `CGIR_JIT_AOT_DEVICE=[0|1]` set to `0` makes the `jit` pass leave alone any device program that still carries its ahead-of-time compiled kernel, i.e. recompile only what `prog-fuse` synthesized (default: 1)
+- `CGIR_JIT_CACHE=[0|1]` caches JIT results (default: 1)
+- `CGIR_JIT_CACHE_MODE=[r|w|rw]` restricts what the on-disk cache may do: `rw` (default), `w` write-only, `r` read-only. It can be used to enforce re-populatation of the cache.
+- `CGIR_JIT_CACHE_DIR=[/path/to/cache/dir]` enables the persistent on-disk cache.
+- `CGIR_JIT_TIMING=[0|1]` set to print, at process exit, a per-phase wall-clock breakdown of JIT compilation accumulated across all compiles.
+- `CGIR_JIT_CACHE_STATS=[0|1]` set to to print, at process exit, statistics about caching (hit, etc.)
+- `CGIR_JIT_STATS_CSV=[0|1]` set to a file path to append, at process exit, the full JIT breakdown (mirrors `CGIR_STATS_CSV`)
 
 # Example
 CGIR is integrated into the [XKRT](https://github.com/anlsys/xkrt) runtime system.
