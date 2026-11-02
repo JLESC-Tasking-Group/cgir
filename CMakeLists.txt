@@ -46,6 +46,7 @@ SET(SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cgir.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/jit-support.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/noalias-llvmir.cc
     # POD interface implementation
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/pack.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/pod/command-graph.cc
@@ -203,6 +204,7 @@ if (USE_LLVM)
     set(CGIR_LLVM_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/jit-support.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/prog-fuse-llvmir.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/noalias-llvmir.cc
     )
     if (NOT LLVM_ENABLE_RTTI)
         set_source_files_properties(${CGIR_LLVM_SOURCES}

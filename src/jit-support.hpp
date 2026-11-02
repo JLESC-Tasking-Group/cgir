@@ -70,9 +70,19 @@ bool env_flag(const char * var);
 /* Value of the env var `var`, or `dflt` when unset/empty. */
 const char * env_str(const char * var, const char * dflt);
 
-/* `CGIR_JIT_DEVICE_NOALIAS`: assume a device kernel's pointer parameters do not
- * overlap. Read once; folded into the cache key, since it changes the code. */
-bool device_assume_noalias_params(void);
+/* `CGIR_JIT_VARIANT`: what the `jit` pass does with a program that already has
+ * an ahead-of-time implementation (device kernel, or host OpenMP task body).
+ * Programs without one (synthesized by prog-fuse) are always compiled.
+ *   jit   recompile and launch the JIT'd code only
+ *   aot   leave such programs alone, keep the ahead-of-time code
+ *   auto  (default) recompile, and keep the ahead-of-time implementation
+ *         (device kernel, or host task routine) beside the result
+ *         (command_prog_t::aot_variant), so the runtime measures both and
+ *         launches the faster.
+ * Read once. Not part of the cache key: it decides whether to compile, not
+ * what the compiled code is. */
+enum jit_variant_mode_t { JIT_VARIANT_JIT, JIT_VARIANT_AOT, JIT_VARIANT_AUTO };
+jit_variant_mode_t jit_variant_mode(void);
 
 /* `CGIR_JIT_DEVICE_LTO`: run the device snapshot through the two-phase pipeline
  * clang uses under -foffload-lto (pre-link O3, link, post-link LTO O3) instead
@@ -153,6 +163,15 @@ void cache_host_put_obj(uint64_t key, const std::string & obj);
 /* Device: emitted PTX. Returns 0 = miss, 1 = from disk, 2 = in-process. */
 int  cache_device_get(uint64_t key, std::string & out);
 void cache_device_put(uint64_t key, const std::string & ptx);
+
+/* Small derived facts keyed like the artifacts (e.g. the noalias set proven for
+ * one instance's argument values), so a warm run need not redo the analysis
+ * that produced them. In-process, plus on disk when CGIR_JIT_CACHE_DIR is set. */
+bool cache_meta_get(uint64_t key, std::string & out);
+void cache_meta_put(uint64_t key, const std::string & v);
+
+/* A key derived from `key` and extra bytes (e.g. a noalias set, argument values). */
+uint64_t cache_key_extend(uint64_t key, const void * data, size_t n);
 
 } /* namespace jit */
 CGIR_NAMESPACE_END

@@ -20,6 +20,7 @@ if (USE_LLVM)
         prog-fuse.cc
         prog-fuse-device-residency.cc
         jit-entry-shape.cc
+        noalias-footprint.cc
     )
 endif()
 

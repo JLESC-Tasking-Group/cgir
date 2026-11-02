@@ -40,10 +40,12 @@
 // (see ../prog-fuse-llvmir.cc).
 
 # include <cgir/namespace.hpp>
+# include <cgir/support.h>
 # include <cgir/command.hpp>
 # include <cgir/command-graph.hpp>
 
 # include "prog-fuse-llvmir.hpp"
+# include "jit-support.hpp"
 
 # include <stdlib.h>
 # include <string.h>
@@ -61,14 +63,14 @@ node_has_llvmir_source(const command_graph_node_t * u)
         && u->command->prog.source.content.llvmir.raw != nullptr;
 }
 
-/* `CGIR_JIT_AOT_DEVICE=0` makes the pass leave alone any device program that
- * still holds its ahead-of-time compiled kernel, i.e. recompile only what
- * prog-fuse synthesized. On by default: recompiling is safe and pays (measured
- * on Krylov CG / GH200: 1.95ms ahead-of-time vs 1.82ms recompiled).
+
+/* What the pass does with a program that already has an ahead-of-time
+ * implementation is chosen by CGIR_JIT_VARIANT (see jit-support.hpp): replace
+ * it (`jit`), keep it (`aot`), or compile and keep both so the runtime picks the
+ * faster by measurement (`auto`, the default).
  *
- * It was NOT safe before the runtime learned to preserve occupancy across a code
- * substitution, and the failure is worth remembering, because nothing about it
- * is visible in the generated code. On a CSR SpMV `omp target teams distribute
+ * Why recompiling is not simply always right, and why the runtime must hold the
+ * occupancy whichever variant runs: on a CSR SpMV `omp target teams distribute
  * parallel for`, the recompiled inner loop is instruction-for-instruction
  * identical to the ahead-of-time one; but ahead-of-time the kernel keeps a
  * runtime `IsSPMDMode` dispatch and a dead duplicate of the loop nest for
@@ -78,33 +80,64 @@ node_has_llvmir_source(const command_graph_node_t * u)
  * co-schedules 16 blocks/SM, they compete for the same cache, and DRAM traffic
  * goes from 168MB to 625MB for a 6x slower kernel. Better code, three times
  * slower. See command_prog_t::blocks_per_sm and the driver-side enforcement
- * (xkrt's cu_prog_prepare) for how that is now held in place -- a driver without
- * that support should set this to 0. */
+ * (xkrt's cu_prog_prepare). And even at equal occupancy the two pipelines win
+ * on different kernels -- hence `auto`. */
+
+/* true iff `prog` still holds an ahead-of-time implementation the pass would
+ * replace: a device kernel handle, or a host OpenMP task routine. Programs
+ * synthesized by prog-fuse have neither -- the pass clears the launcher
+ * precisely to mean "must be JIT'd". */
 static inline bool
-jit_recompiles_aot_device(void)
+prog_has_aot(const command_prog_t * prog)
 {
-    static const bool value = [] {
-        const char * e = getenv("CGIR_JIT_AOT_DEVICE");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    return value;
+    if (prog->source.content.llvmir.triple != nullptr)               /* device */
+        return prog->launcher.variadic.fn != nullptr;
+    return prog->prototype == CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_KMP /* host */
+        && prog->launcher.kmp.fn != nullptr;
 }
 
-/* true iff the pass must leave `prog` alone: a device program that already holds
- * the kernel handle of its ahead-of-time compiled image, with recompilation
- * disabled (see jit_recompiles_aot_device).
- *
- * Programs synthesized by prog-fuse have no ahead-of-time counterpart -- the
- * pass clears `launcher.variadic.fn` precisely to mean "must be JIT'd" -- so
- * they are never skipped. Host programs are never skipped either: for them the
- * JIT is a real specialization (externalized globals bound to their runtime
- * addresses, task body inlined into a direct call, KMP dispatch dropped). */
-static inline bool
-jit_skips_aot_device(const command_prog_t * prog)
+static void
+jit_prog(command_prog_t * prog)
 {
-    return prog->source.content.llvmir.triple != nullptr   /* device program */
-        && prog->launcher.variadic.fn != nullptr           /* AOT kernel available */
-        && !jit_recompiles_aot_device();
+# if !CGIR_SUPPORT_LLVM
+    command_graph_jit_llvmir(prog);     /* reports and aborts */
+# else
+    const jit::jit_variant_mode_t mode = jit::jit_variant_mode();
+    const bool has_aot = prog_has_aot(prog);
+    const bool device  = prog->source.content.llvmir.triple != nullptr;
+
+    if (has_aot && mode == jit::JIT_VARIANT_AOT)
+        return ;
+
+    /* Keep the ahead-of-time implementation for the runtime to measure
+     * against: the kernel handle of a device program, the task routine of a
+     * host one (whose JIT'd replacement changes the calling convention but not
+     * the task, so the routine stays valid). */
+    const bool keep = has_aot && mode == jit::JIT_VARIANT_AUTO;
+    void (*aot_fn)(void **)        = (keep && device)  ? prog->launcher.variadic.fn : nullptr;
+    int  (*aot_kmp_fn)(int, void *) = (keep && !device) ? prog->launcher.kmp.fn      : nullptr;
+    void * aot_kmp_task             = (keep && !device) ? prog->launcher.kmp.task    : nullptr;
+    const unsigned int aot_dyn = prog->dyn_shmem;
+
+    command_graph_jit_llvmir(prog);
+
+    /* The JIT may decline a program (entry not externally resolvable) and leave
+     * it untouched; only a program whose code it actually replaced has two. */
+    const bool replaced = device
+        ? (prog->source.type == COMMAND_PROG_SOURCE_TYPE_PTX)
+        : (prog->prototype != CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_KMP);
+    if (!replaced)
+    {
+        aot_fn     = nullptr;
+        aot_kmp_fn = nullptr;
+    }
+
+    prog->aot_variant.fn        = aot_fn;
+    prog->aot_variant.dyn_shmem = aot_dyn;
+    prog->aot_variant.kmp_fn    = aot_kmp_fn;
+    prog->aot_variant.kmp_task  = aot_kmp_fn ? aot_kmp_task : nullptr;
+    prog->aot_variant.selected  = CGIR_COMMAND_PROG_VARIANT_UNDECIDED;
+# endif
 }
 
 void
@@ -112,7 +145,7 @@ command_graph_t::pass_jit(void)
 {
     this->walk([&] (command_graph_node_t * node)
     {
-        if (node_has_llvmir_source(node) && !jit_skips_aot_device(&node->command->prog))
-            command_graph_jit_llvmir(&node->command->prog);
+        if (node_has_llvmir_source(node))
+            jit_prog(&node->command->prog);
     });
 }

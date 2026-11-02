@@ -43,10 +43,11 @@ You may set the following environment variables
 JIT compilation caching and profiling (the `jit` pass compiles each program's
 LLVM IR to a host function or device PTX):
 - `CGIR_JIT_HOST_CODE_MODEL=[small|large]` selects the LLVM's code model for host programs: `small`(default) or `large`.
-- `CGIR_JIT_DEVICE_NOALIAS=[0|1]` set to make the `jit` pass assume that pointer parameters of a device kernel do not overlap (default: 1).
+- `CGIR_NOALIAS=[prove|distinct-base|none]` what the `prog-fuse` and `jit` passes may tell LLVM about aliasing (default: `prove`). `prove` marks a pair of pointers non-aliasing only when an analysis of the final code proves their accessed byte ranges disjoint for the actual argument values (direct accesses only; sound). `distinct-base` assumes pointers with different runtime values never overlap, so pointer deduplication is sufficient (an assumption about the program). `none` marks nothing.
+- `CGIR_NOALIAS_VERIFY=[0|1|abort]` check every `distinct-base` assumption with the `prove` analysis and report each as proven or not proven (unbounded footprint, or bounded footprints that overlap: a possible violation), with a summary at exit (`abort` stops at the first possible violation). Under `prove`, reports how many candidates were proven.
 - `CGIR_JIT_DEVICE_MINCTASM=[0|1]` control either the device JIT declares recorded occupancy (`command_prog_t::blocks_per_sm`) to the PTX assembler as `.minnctapersm` (default: 1).
 - `CGIR_JIT_DEVICE_LTO=[0|1]` set to `0` makes the device JIT run a single per-module O3 after linking the DeviceRTL, instead of the two-phase pipeline clang use   under `-foffload-lto` (pre-link O3, link, post-link `lto<O3>`).
-- `CGIR_JIT_AOT_DEVICE=[0|1]` set to `0` makes the `jit` pass leave alone any device program that still carries its ahead-of-time compiled kernel, i.e. recompile only what `prog-fuse` synthesized (default: 1)
+- `CGIR_JIT_VARIANT=[auto|jit|aot]` what the `jit` pass does with a program that already has an ahead-of-time implementation (default: `auto`). `jit` replaces it, `aot` keeps it (only programs without one, e.g. fused ones, are compiled), `auto` compiles them while keeping the ahead-of-time implementation (device kernel or host task routine), and the runtime measures both and launches the faster (see XKRT `XKRT_PROG_VARIANT_SAMPLES`).
 - `CGIR_JIT_CACHE=[0|1]` caches JIT results (default: 1)
 - `CGIR_JIT_CACHE_MODE=[r|w|rw]` restricts what the on-disk cache may do: `rw` (default), `w` write-only, `r` read-only. It can be used to enforce re-populatation of the cache.
 - `CGIR_JIT_CACHE_DIR=[/path/to/cache/dir]` enables the persistent on-disk cache.

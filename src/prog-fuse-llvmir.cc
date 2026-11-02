@@ -68,15 +68,21 @@
 
 # include "prog-fuse-llvmir.hpp"
 # include "jit-support.hpp"
+# include "noalias-llvmir.hpp"
 
 # if CGIR_SUPPORT_LLVM
 
 # include <llvm/ADT/DenseMap.h>
 # include <llvm/ADT/DenseSet.h>
 # include <llvm/ADT/PostOrderIterator.h>
-# include <llvm/ADT/StringExtras.h>    /* utostr, for the .minnctapersm attribute */
+# include <llvm/ADT/StringExtras.h>
+# include <llvm/ADT/StringSet.h>    /* utostr, for the .minnctapersm attribute */
 # include <llvm/Analysis/AliasAnalysis.h>
 # include <llvm/Analysis/InlineCost.h>
+# include <llvm/Analysis/CFG.h>
+# include <llvm/Analysis/LoopInfo.h>
+# include <llvm/IR/CFG.h>
+# include <llvm/IR/Dominators.h>
 # include <llvm/Analysis/MemoryLocation.h>
 # include <llvm/Analysis/ScalarEvolution.h>
 # include <llvm/Analysis/ValueTracking.h>
@@ -90,6 +96,7 @@
 # include <llvm/IR/IntrinsicInst.h>
 # include <llvm/IR/LLVMContext.h>
 # include <llvm/IR/MDBuilder.h>
+# include <llvm/IR/InstIterator.h>
 # include <llvm/IR/Module.h>
 # include <llvm/IR/Verifier.h>
 # include <llvm/IRReader/IRReader.h>
@@ -154,6 +161,7 @@
 # include <optional>
 # include <string>
 # include <unordered_map>
+# include <mutex>
 # include <utility>
 # include <vector>
 
@@ -365,96 +373,151 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
         F->setName(prefix + F->getName().str());
 }
 
-/* Attach shared-domain scoped-noalias metadata to the fused wrapper's memory
- * accesses: one alias scope per distinct captured base pointer, with every data
- * access marked `noalias` against all the OTHER bases. This is the restrict-like
- * assumption (distinct captured base pointer => non-overlapping), consistent with
- * prog-fuse's dedup contract (the same array collapses to one slot, hence one base
- * load, so distinct base loads are distinct arrays).
+/* Attach shared-domain scoped-noalias metadata between the deduplicated captures
+ * of a fused host program, as CGIR_NOALIAS says (see noalias-llvmir.hpp).
  *
- * A "captured base" is a pointer LOADED from the args buffer -- the deduplicated
- * array base each kernel reads/writes through. We restrict tagging to loads/stores
- * of NON-pointer values (the actual array data) so the args-buffer pointer chasing
- * is skipped, and require the access's underlying object to be a load (the base),
- * so stack temporaries are left alone.
+ * Every argument-slot load the wrapper hoists carries "cgir.fuse.slot" (its
+ * unique slot index), and `slot_addr[k]` is the slot's runtime &value, which
+ * the fused program is replayed with. The captured bases are the pointer-typed
+ * slot loads marked "cgir.fuse.base"; the integer-typed ones give the analysis
+ * the scalars (loop bounds, offsets) it needs to bound footprints. Each base
+ * gets a scope, and every access attributed to base i is declared not to alias
+ * the scopes of the bases j it is disjoint from:
  *
- * MUST run AFTER SROA (see optimize_module): only then does each array access
- * resolve to its base load -- uniformly for the pointers (void**, base = the
- * &value's deref) and packed (void*,size_t, base = the pointer read from the
- * buffer) shapes. With it, DependenceAnalysis can fuse the loops and the loop
- * vectorizer needs no runtime alias check. */
+ *   prove          the analysis bounds both footprints and they do not overlap
+ *                  (or neither is written);
+ *   distinct-base  the two bases have different runtime values -- the slot
+ *                  deduplication is then all the evidence there is.
+ *
+ * Pairwise, not all-or-nothing: one unprovable pair does not cost the others.
+ * Only tagged accesses are affected, so accesses the analysis could not
+ * attribute keep LLVM's own (conservative) answer.
+ *
+ * MUST run after SROA and loop canonicalization (see optimize_module): only
+ * then does each array access resolve to its base load, and does SCEV know the
+ * loops' trip counts. */
 static void
-tag_noalias_domains(llvm::Function & F)
+tag_noalias_domains(llvm::Function & F,
+                    const std::vector<void *> * slot_addr,
+                    const std::vector<size_t> * slot_size)
 {
-    llvm::LLVMContext & ctx = F.getContext();
-    llvm::MDBuilder mdb(ctx);
-    llvm::MDNode * domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
+    const noalias::policy_t mode = noalias::mode();
+    if (mode == noalias::MODE_NONE || slot_addr == nullptr)
+        return ;
 
-    /* Only the deduplicated CAPTURE base loads carry the "cgir.fuse.base" marker
-     * (stamped where they are hoisted, see command_graph_prog_fuse_llvmir). We tag
-     * exactly those, never arbitrary loaded pointers: the restrict-like "distinct
-     * base => no overlap" assumption is only valid for distinct captures (same
-     * array collapses to one slot = one marked load), NOT for pointers a body loads
-     * from its own data (e.g. pointer-array/linked-structure chasing), which could
-     * genuinely alias. Missing the marker just leaves an access untagged
-     * (conservative), never mis-tagged. */
+    llvm::LLVMContext & ctx = F.getContext();
+    const unsigned slot_kind = ctx.getMDKindID("cgir.fuse.slot");
     const unsigned base_kind = ctx.getMDKindID("cgir.fuse.base");
 
-    /* the deduplicated captured base of a taggable data access, or nullptr */
-    auto data_base = [&] (llvm::Instruction & I) -> llvm::Value *
+    std::vector<noalias::base_t> bases;
+    noalias::env_t               env;
+    for (llvm::Instruction & I : llvm::instructions(F))
+    {
+        auto * L = llvm::dyn_cast<llvm::LoadInst>(&I);
+        llvm::MDNode * md = L ? L->getMetadata(slot_kind) : nullptr;
+        if (md == nullptr || md->getNumOperands() != 1)
+            continue ;
+        const auto * ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md->getOperand(0));
+        if (ci == nullptr)
+            continue ;
+        const uint64_t k = ci->getZExtValue();
+        if (k >= slot_addr->size() || (*slot_addr)[k] == nullptr)
+            continue ;
+        const void * at = (*slot_addr)[k];
+        if (L->getType()->isPointerTy() && L->getMetadata(base_kind))
+        {
+            uint64_t v = 0;
+            memcpy(&v, at, sizeof(void *));
+            bases.push_back({L, v});
+        }
+        else if (L->getType()->isIntegerTy() && L->getType()->getIntegerBitWidth() <= 64)
+        {
+            const unsigned w     = L->getType()->getIntegerBitWidth();
+            const size_t   bytes = (w + 7) / 8;
+            if (slot_size && k < slot_size->size() && (*slot_size)[k] < bytes)
+                continue ;
+            uint64_t raw = 0;
+            memcpy(&raw, at, bytes);
+            env.consts[L] = (w == 64) ? (int64_t) raw : (int64_t) (raw << (64 - w)) >> (64 - w);
+        }
+    }
+    if (bases.size() < 2)
+        return ;
+
+    const bool analyse = (mode == noalias::MODE_PROVE) || noalias::verify();
+    noalias::result_t r;
+    if (analyse)
+        r = noalias::analyze(F, bases, env);
+
+    const size_t n = bases.size();
+    std::vector<std::vector<bool>> disjoint(n, std::vector<bool>(n, false));
+    unsigned proven = 0, candidates = 0;
+    for (size_t i = 0 ; i < n ; ++i)
+        for (size_t j = i + 1 ; j < n ; ++j)
+        {
+            bool d;
+            if (mode == noalias::MODE_DISTINCT_BASE)
+            {
+                d = (bases[i].addr != bases[j].addr);
+                if (d && noalias::verify())
+                    noalias::report_assumption(
+                        "fused program `" + F.getParent()->getModuleIdentifier() + "` bases " +
+                        std::to_string(i) + "," + std::to_string(j),
+                        r.base[i], bases[i].addr, r.base[j], bases[j].addr);
+            }
+            else
+            {
+                const noalias::footprint_t & a = r.base[i], & b = r.base[j];
+                d = !noalias::may_conflict(a, bases[i].addr, b, bases[j].addr);
+                if (a.accessed() && b.accessed() && (a.mod || b.mod))
+                {
+                    ++candidates;
+                    if (d) ++proven;
+                }
+            }
+            disjoint[i][j] = disjoint[j][i] = d;
+        }
+    if (mode == noalias::MODE_PROVE)
+        noalias::report_proven(proven, candidates);
+
+    llvm::MDBuilder mdb(ctx);
+    llvm::MDNode * domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
+    std::vector<llvm::MDNode *> scope(n);
+    for (size_t i = 0 ; i < n ; ++i)
+        scope[i] = mdb.createAnonymousAliasScope(domain, "cgir.prog-fuse.base");
+
+    llvm::DenseMap<const llvm::Value *, size_t> index;
+    for (size_t i = 0 ; i < n ; ++i)
+        index[bases[i].v] = i;
+
+    for (llvm::Instruction & I : llvm::instructions(F))
     {
         llvm::Value * ptr = llvm::getLoadStorePointerOperand(&I);
         if (ptr == nullptr)
-            return nullptr;
-        llvm::Type * ty = nullptr;
-        if (auto * LI = llvm::dyn_cast<llvm::LoadInst>(&I))
-            ty = LI->getType();
-        else if (auto * SI = llvm::dyn_cast<llvm::StoreInst>(&I))
-            ty = SI->getValueOperand()->getType();
-        if (ty == nullptr || ty->isPointerTy())
-            return nullptr; /* skip args-buffer pointer chasing */
-        llvm::Value * base = llvm::getUnderlyingObject(ptr);
-        auto * L = llvm::dyn_cast<llvm::LoadInst>(base);
-        return (L && L->getMetadata(base_kind)) ? base : nullptr;
-    };
-
-    std::unordered_map<llvm::Value *, llvm::MDNode *> base_to_scope;
-    std::vector<llvm::Metadata *>                     all_scopes;
-    for (llvm::BasicBlock & BB : F)
-        for (llvm::Instruction & I : BB)
         {
-            llvm::Value * base = data_base(I);
-            if (base == nullptr)
-                continue;
-            if (base_to_scope.find(base) == base_to_scope.end())
-            {
-                llvm::MDNode * sc = mdb.createAnonymousAliasScope(domain, "cgir.prog-fuse.base");
-                base_to_scope[base] = sc;
-                all_scopes.push_back(sc);
-            }
+            if (auto * A = llvm::dyn_cast<llvm::AtomicRMWInst>(&I))       ptr = A->getPointerOperand();
+            else if (auto * X = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) ptr = X->getPointerOperand();
         }
-
-    /* With <2 distinct bases there is nothing to disambiguate. */
-    if (all_scopes.size() < 2)
-        return ;
-
-    for (llvm::BasicBlock & BB : F)
-        for (llvm::Instruction & I : BB)
-        {
-            llvm::Value * base = data_base(I);
-            if (base == nullptr)
-                continue;
-            llvm::Metadata * own = base_to_scope[base];
-            I.setMetadata(llvm::LLVMContext::MD_alias_scope,
-                          llvm::MDNode::get(ctx, { own }));
-            std::vector<llvm::Metadata *> others;
-            others.reserve(all_scopes.size() - 1);
-            for (llvm::Metadata * s : all_scopes)
-                if (s != own)
-                    others.push_back(s);
-            I.setMetadata(llvm::LLVMContext::MD_noalias,
-                          llvm::MDNode::get(ctx, others));
-        }
+        if (ptr == nullptr)
+            continue ;
+        auto it = index.find(llvm::getUnderlyingObject(ptr));
+        if (it == index.end())
+            continue ;
+        const size_t i = it->second;
+        std::vector<llvm::Metadata *> others;
+        for (size_t j = 0 ; j < n ; ++j)
+            if (j != i && disjoint[i][j])
+                others.push_back(scope[j]);
+        if (others.empty())
+            continue ;
+        /* concatenate: keep whatever scopes inlining already attached */
+        I.setMetadata(llvm::LLVMContext::MD_alias_scope,
+            llvm::MDNode::concatenate(I.getMetadata(llvm::LLVMContext::MD_alias_scope),
+                                      llvm::MDNode::get(ctx, { scope[i] })));
+        I.setMetadata(llvm::LLVMContext::MD_noalias,
+            llvm::MDNode::concatenate(I.getMetadata(llvm::LLVMContext::MD_noalias),
+                                      llvm::MDNode::get(ctx, others)));
+    }
 }
 
 /* Structural (by-value) equality of two constants. prog-fuse parses every kernel
@@ -505,6 +568,46 @@ constant_value_equal(llvm::Constant * a, llvm::Constant * b)
  * command_graph_prog_fuse_llvmir -- and the launch must preserve it (in CUDA, a
  * cooperative launch).
  * ------------------------------------------------------------------------- */
+
+/* The placeholder prog-fuse emits between fused device bodies: a call to an
+ * external, convergent declaration. The optimizer must treat it as reading and
+ * writing anything (so no access crosses it) and cannot move it into or out of
+ * control flow (convergent); "ompx_spmd_amenable" tells OpenMPOpt that it does
+ * not prevent SPMD execution. Lowered by lower_grid_barrier_markers. */
+static llvm::Function *
+get_grid_barrier_marker(llvm::Module & M)
+{
+    llvm::LLVMContext & ctx = M.getContext();
+    llvm::FunctionCallee fc = M.getOrInsertFunction(CGIR_GRID_BARRIER_MARKER,
+        llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), false));
+    llvm::Function * F = llvm::cast<llvm::Function>(fc.getCallee());
+    F->addFnAttr(llvm::Attribute::Convergent);
+    F->addFnAttr(llvm::Attribute::NoUnwind);
+    /* NOT "ompx_aligned_barrier": OpenMPOpt deletes aligned barriers it finds
+     * redundant, and a deleted marker is a deleted grid barrier (measured: a
+     * fused xpby+SpMV then computes the wrong answer). */
+    F->addFnAttr("llvm.assume", "ompx_spmd_amenable");
+    return F;
+}
+
+static std::vector<unsigned> device_runtime_env_params(const llvm::Function & entry);
+static bool fused_device_kernel_avoids_grid_barrier(const llvm::Module & fused,
+                                                    const command_prog_t * proto,
+                                                    void ** slots, size_t nslots,
+                                                    std::string & why);
+
+/* The marker calls of `F`, in instruction order. */
+static std::vector<llvm::CallInst *>
+grid_barrier_markers(llvm::Function & F)
+{
+    std::vector<llvm::CallInst *> out;
+    for (llvm::Instruction & I : llvm::instructions(F))
+        if (auto * CI = llvm::dyn_cast<llvm::CallInst>(&I))
+            if (const llvm::Function * callee = CI->getCalledFunction())
+                if (callee->getName() == CGIR_GRID_BARRIER_MARKER)
+                    out.push_back(CI);
+    return out;
+}
 
 /* The barrier's shared state, created once per fused module: an arrival counter
  * that returns to zero at each barrier, and a generation counter that only ever
@@ -632,6 +735,87 @@ emit_grid_barrier(llvm::IRBuilder<> & b, llvm::Module & M)
     return cont;
 }
 
+/* Lower the barrier markers of `F` as `plan` says: one character per marker,
+ * indexed by its "cgir.barrier" tag ('0' none, '1' block barrier, '2' grid
+ * barrier; a marker the plan does not cover gets the grid barrier). Returns
+ * whether a grid barrier remains, i.e. whether the kernel still needs every
+ * block resident. */
+static bool
+lower_grid_barrier_markers(llvm::Function & F, const std::string & plan)
+{
+    llvm::Module & M = *F.getParent();
+    llvm::LLVMContext & ctx = M.getContext();
+    const unsigned tag = ctx.getMDKindID("cgir.barrier");
+    bool grid = false;
+    for (llvm::CallInst * CI : grid_barrier_markers(F))
+    {
+        char how = '2';
+        if (llvm::MDNode * md = CI->getMetadata(tag))
+            if (const auto * k = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md->getOperand(0)))
+                if (k->getZExtValue() < plan.size())
+                    how = plan[k->getZExtValue()];
+        if (how == '0')
+        {
+            CI->eraseFromParent();
+            continue ;
+        }
+        if (how == '1')
+        {
+            llvm::IRBuilder<> b(CI);
+            b.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                             &M, llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all),
+                         { b.getInt32(0) });
+            CI->eraseFromParent();
+            continue ;
+        }
+        /* grid barrier: emit_grid_barrier builds from the end of an open block */
+        grid = true;
+        llvm::BasicBlock * BB   = CI->getParent();
+        llvm::BasicBlock * tail = BB->splitBasicBlock(std::next(CI->getIterator()), "cgir.gb.after");
+        BB->getTerminator()->eraseFromParent();
+        CI->eraseFromParent();
+        llvm::IRBuilder<> b(BB);
+        emit_grid_barrier(b, M);
+        b.CreateBr(tail);
+    }
+    if (llvm::Function * marker = M.getFunction(CGIR_GRID_BARRIER_MARKER))
+        if (marker->use_empty())
+            marker->eraseFromParent();
+    return grid;
+}
+
+/* Abort if the optimizer lost a barrier marker: every marker stands for an
+ * ordering the fused bodies need, and one that vanished before being lowered
+ * would silently drop it. */
+static void
+check_markers_survived(llvm::Function & F, size_t expected)
+{
+    const size_t now = grid_barrier_markers(F).size();
+    if (now != expected)
+    {
+        fprintf(stderr, "jit(device): `%s` had %zu barrier markers before optimization and "
+                        "%zu after; refusing to emit a kernel that may have lost one\n",
+                F.getName().str().c_str(), expected, now);
+        abort();
+    }
+}
+
+/* Number the barrier markers of `F` in instruction order ("cgir.barrier"), so
+ * that a plan computed on a transformed copy applies to the original. Returns
+ * how many there are. Idempotent. */
+static size_t
+tag_grid_barrier_markers(llvm::Function & F)
+{
+    llvm::LLVMContext & ctx = F.getContext();
+    const unsigned tag = ctx.getMDKindID("cgir.barrier");
+    std::vector<llvm::CallInst *> ms = grid_barrier_markers(F);
+    for (size_t k = 0 ; k < ms.size() ; ++k)
+        if (!ms[k]->getMetadata(tag))
+            ms[k]->setMetadata(tag, llvm::MDNode::get(ctx,
+                { llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), k)) }));
+    return ms.size();
+}
+
 /* Collect the per-kernel target_init / target_deinit calls of `F`, in block
  * order. Split out because the brackets must be re-found after the canonicalizing
  * passes below, which may replace the instructions holding them. */
@@ -754,7 +938,9 @@ static void dump_module(const std::string & dir, const char * name, llvm::Module
  * after the DeviceRTL is linked, so O3 can inline the runtime). */
 static void
 optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & dump_dir,
-                bool run_o3 = true)
+                bool run_o3 = true,
+                const std::vector<void *> * slot_addr = nullptr,
+                const std::vector<size_t> * slot_size = nullptr)
 {
     llvm::PassBuilder PB(tm);
 
@@ -811,9 +997,21 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & 
         MPM1.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM1)));
         MPM1.run(M, MAM);
 
-        /* 2. attach scoped-noalias now that accesses resolve to their base loads */
+        /* 2. canonicalize + rotate the loops, so SCEV knows their trip counts */
+        {
+            llvm::FunctionPassManager FPM2;
+            FPM2.addPass(llvm::LoopSimplifyPass());
+            llvm::LoopPassManager LPM;
+            LPM.addPass(llvm::LoopRotatePass());
+            FPM2.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
+            llvm::ModulePassManager MPM2;
+            MPM2.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM2)));
+            MPM2.run(M, MAM);
+        }
+
+        /* 3. attach scoped-noalias now that accesses resolve to their base loads */
         if (llvm::Function * wrapper = M.getFunction("__fused_wrapper"))
-            tag_noalias_domains(*wrapper);
+            tag_noalias_domains(*wrapper, slot_addr, slot_size);
         /* the tagging edited IR outside the pass managers; drop cached analyses so
          * the loop passes below see the new metadata. */
         MAM.invalidate(M, llvm::PreservedAnalyses::none());
@@ -821,16 +1019,14 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & 
         /* dump the exact IR loop-fusion will see (post cleanup + noalias, pre-fuse) */
         dump_module(dump_dir, "prefuse.ll", M);
 
-        /* 3. canonicalize + rotate + fuse the loops */
-        llvm::FunctionPassManager FPM2;
-        FPM2.addPass(llvm::LoopSimplifyPass());
-        llvm::LoopPassManager LPM;
-        LPM.addPass(llvm::LoopRotatePass());
-        FPM2.addPass(llvm::createFunctionToLoopPassAdaptor(std::move(LPM)));
-        FPM2.addPass(llvm::LoopFusePass());
-        llvm::ModulePassManager MPM2;
-        MPM2.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM2)));
-        MPM2.run(M, MAM);
+        /* 4. fuse the loops */
+        {
+            llvm::FunctionPassManager FPM3;
+            FPM3.addPass(llvm::LoopFusePass());
+            llvm::ModulePassManager MPM3;
+            MPM3.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM3)));
+            MPM3.run(M, MAM);
+        }
     }
 
     if (run_o3)
@@ -998,6 +1194,9 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     const char * dev_triple = progs[0]->source.content.llvmir.triple;
     const char * dev_arch   = progs[0]->source.content.llvmir.arch;
     const bool   device     = (dev_triple != nullptr);
+    /* set when fusing is only legal if no grid-wide barrier remains */
+    bool         grid_barrier_must_vanish = false;
+    std::string  coresident_why;
     if (device)
     {
         for (size_t i = 0 ; i < n ; ++i)
@@ -1037,25 +1236,21 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                               * (uint64_t) progs[0]->grid.z;
         const unsigned coresident = progs[0]->max_coresident_blocks;
         const unsigned per_sm     = progs[0]->blocks_per_sm;
-        if (coresident == 0 || per_sm == 0)
-        {
-            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: the "
-                            "runtime did not report how many blocks fit on the device, "
-                            "so the grid-wide barrier a fused kernel needs cannot be "
-                            "shown to complete [%s]\n",
-                    n, prog_describe(progs[0]).c_str());
-            return false;
-        }
-        const unsigned nsm = coresident / per_sm;   /* multiprocessors */
+        const unsigned nsm        = (coresident && per_sm) ? coresident / per_sm : 0;
         if (nsm == 0 || blocks > (uint64_t) nsm)
         {
-            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: its "
-                            "grid of %llu blocks exceeds the %u multiprocessors, and a "
-                            "fused kernel is only guaranteed one resident block each, "
-                            "so a grid-wide barrier could hang [%s]\n",
-                    n, (unsigned long long) blocks, nsm,
-                    prog_describe(progs[0]).c_str());
-            return false;
+            /* Not a refusal yet: the grid barrier is only needed where a body
+             * reads what another thread of the previous one wrote. Whether that
+             * happens is decided once the fused kernel is built (see
+             * fused_device_kernel_avoids_grid_barrier below); if no barrier
+             * needs grid scope, residency does not matter. */
+            grid_barrier_must_vanish = true;
+            if (nsm == 0)
+                coresident_why = "the runtime did not report how many blocks fit on the device";
+            else
+                coresident_why = "its grid of " + std::to_string(blocks) + " blocks exceeds the " +
+                                 std::to_string(nsm) + " multiprocessors, a fused kernel is only "
+                                 "guaranteed one resident block each";
         }
     }
 
@@ -1637,13 +1832,39 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             ab.removeAttribute(llvm::Attribute::AlwaysInline);
             wrapper->addFnAttrs(ab);
         }
-        /* distinct captured pointers are assumed non-overlapping (restrict) */
-        for (unsigned k = 0 ; k < total_args ; ++k)
-            if (ptypes[k]->isPointerTy())
-                wrapper->addParamAttr(k, llvm::Attribute::NoAlias);
+        /* CGIR_NOALIAS=distinct-base: captured pointers with distinct VALUES
+         * are assumed not to overlap. By value, not by slot: dedup merges slots
+         * by address for device leaves, so two slots may still hold the same
+         * pointer, and marking both would be wrong even under the assumption.
+         * Under `prove` nothing is marked here: the jit pass analyses the fused
+         * kernel in its final form and marks what it can prove. */
+        if (noalias::mode() == noalias::MODE_DISTINCT_BASE)
+            for (unsigned k = 0 ; k < total_args ; ++k)
+            {
+                if (!ptypes[k]->isPointerTy() || unique_slots[k] == nullptr)
+                    continue ;
+                void * vk = *static_cast<void * const *>(unique_slots[k]);
+                bool unique = (vk != nullptr);
+                for (unsigned j = 0 ; unique && j < total_args ; ++j)
+                    if (j != k && ptypes[j]->isPointerTy() && unique_slots[j] != nullptr &&
+                        *static_cast<void * const *>(unique_slots[j]) == vk)
+                        unique = false;
+                if (unique)
+                    wrapper->addParamAttr(k, llvm::Attribute::NoAlias);
+            }
 
         llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
         llvm::IRBuilder<> builder(bb);
+        /* Each constituent's launch environment (`dyn_ptr`) lands in its own
+         * wrapper parameter; say which, since names do not survive and the
+         * analyses must not take runtime scratch for user data. */
+        for (size_t i = 0 ; i < n ; ++i)
+            if (llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name))
+                for (unsigned j : device_runtime_env_params(*fn))
+                    if (j < inputs[i].arity)
+                        wrapper->addParamAttr(index_map[i][j],
+                            llvm::Attribute::get(llvmctx, "cgir.runtime-env"));
+
         std::vector<llvm::CallInst *> kernel_calls;
         kernel_calls.reserve(n);
         for (size_t i = 0 ; i < n ; ++i)
@@ -1651,9 +1872,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             /* Restore the ordering the launch boundary used to give. Emitting it
              * here -- between the calls, before they are inlined -- means it does
              * not depend on anything about the bodies' shape: whatever they turn
-             * into, the barrier stays between them. */
+             * into, the barrier stays between them. It is a marker for now: the
+             * jit pass lowers it, once the kernel is in its final form, to the
+             * weakest synchronization the accesses around it need (see
+             * noalias::barrier_requirements) -- often none at all. */
             if (i > 0)
-                emit_grid_barrier(builder, *mod_u);
+                builder.CreateCall(get_grid_barrier_marker(*mod_u));
 
             llvm::Function * fn = mod_u->getFunction(inputs[i].fused_name);
             std::vector<llvm::Value *> call_args;
@@ -1824,6 +2048,16 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (auto * L = llvm::dyn_cast<llvm::LoadInst>(v))
             L->setMetadata(base_kind, llvm::MDNode::get(llvmctx, {}));
     };
+    /* Every hoisted slot load also records WHICH unique slot it reads, so the
+     * aliasing analysis can bind it to the slot's runtime value (bases) or use
+     * it as a known scalar (bounds). */
+    const unsigned slot_kind = llvmctx.getMDKindID("cgir.fuse.slot");
+    auto mark_slot = [&] (llvm::Value * v, unsigned k)
+    {
+        if (auto * L = llvm::dyn_cast<llvm::LoadInst>(v))
+            L->setMetadata(slot_kind, llvm::MDNode::get(llvmctx,
+                { llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64_ty, k)) }));
+    };
 
     /* Load slot `idx` as type T. void** form: args[idx] is a &value (double load).
      * packed form: the value is inline at args_ptr + slot_offset[idx] (one load). */
@@ -1858,6 +2092,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         if (slot_type[k] != nullptr)
         {
             slot_value[k] = load_arg(k, slot_type[k]);
+            mark_slot(slot_value[k], k);
             if (slot_type[k]->isPointerTy())
                 mark_base(slot_value[k]); /* a captured array/pointer base */
         }
@@ -1903,6 +2138,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             slot_hoist[k] = builder.CreateAlignedLoad(
                 ht, src, llvm::MaybeAlign(1),
                 unique_slot_is_ref[k] ? "refbase" : "copyval");
+            mark_slot(slot_hoist[k], k);
             if (unique_slot_is_ref[k])
                 mark_base(slot_hoist[k]); /* a captured array/pointer base */
         }
@@ -2082,7 +2318,20 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * chains defer the final O3 to emit_device_ptx (post DeviceRTL link); host
      * chains run the full pipeline here. */
     if (tm)
-        optimize_module(*mod_u, tm.get(), dump_dir, /* run_o3 = */ !device);
+        optimize_module(*mod_u, tm.get(), dump_dir, /* run_o3 = */ !device,
+                        &unique_slots, &unique_slot_size);
+
+    if (device && grid_barrier_must_vanish)
+    {
+        std::string why;
+        if (!fused_device_kernel_avoids_grid_barrier(*mod_u, progs[0], unique_slots.data(),
+                                                     unique_slots.size(), why))
+        {
+            fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: %s, and %s [%s]\n",
+                    n, coresident_why.c_str(), why.c_str(), prog_describe(progs[0]).c_str());
+            return false;
+        }
+    }
 
     /* dump the final fused/optimized module */
     if (dump)
@@ -2309,6 +2558,14 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * learns it has to honour it. */
     dst->max_coresident_blocks    = progs[0]->max_coresident_blocks;
     dst->requires_coresident_grid = device;
+    /* A fused program's barrier plan is proven for its recorded grid. */
+    dst->grid_flexible = false;
+    /* A fused program has no ahead-of-time counterpart to fall back to. */
+    dst->aot_variant.fn        = nullptr;
+    dst->aot_variant.dyn_shmem = 0;
+    dst->aot_variant.kmp_fn    = nullptr;
+    dst->aot_variant.kmp_task  = nullptr;
+    dst->aot_variant.selected  = CGIR_COMMAND_PROG_VARIANT_UNDECIDED;
 
     /* ------------------------------------------------------------------ *
      * 12. Release the consumed inputs' owned heap buffers.                 *
@@ -2695,36 +2952,71 @@ device_features_of(const llvm::Module & M)
  * module's triple/DataLayout, and run codegen to a PTX assembly string. Returns
  * the PTX (empty + `err` set on failure). The CUDA driver JIT-compiles this PTX
  * to SASS at cuModuleLoadData (see the xkrt driver). */
-static std::string
-emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
-                const char * const * libs, size_t nlibs,
-                const std::string & dump_dir, std::string & err)
+/* The NVPTX TargetMachine for `triple`/`arch` with the snapshot's `features`
+ * (see device_features_of -- they must be read before anything is linked in). */
+static std::unique_ptr<llvm::TargetMachine>
+make_device_tm(const char * triple, const char * arch, const std::string & features,
+               std::string & err)
 {
     llvm::Triple TT(triple);
     std::string terr;
     const llvm::Target * T = llvm::TargetRegistry::lookupTarget(TT, terr);
-    if (!T) { err = "lookupTarget('" + TT.str() + "'): " + terr; return {}; }
-
-    /* Read the features off the snapshot BEFORE anything is linked/optimized in:
-     * at this point the module holds only the compiler-emitted device functions. */
-    const std::string features = device_features_of(M);
+    if (!T) { err = "lookupTarget('" + TT.str() + "'): " + terr; return nullptr; }
 
     llvm::TargetOptions opts;
     std::unique_ptr<llvm::TargetMachine> TM(T->createTargetMachine(
         TT, arch ? arch : "", features, opts,
         std::nullopt, std::nullopt, llvm::CodeGenOptLevel::Aggressive));
-    if (!TM) { err = "createTargetMachine failed"; return {}; }
+    if (!TM) err = "createTargetMachine failed";
+    return TM;
+}
 
-    M.setTargetTriple(TT);
+/* Link a "builtin" device library (see cgir_command_prog_source_t::
+ * device_builtin_libs) the way clang's -mlink-builtin-bitcode does: import only
+ * what `M` references, and make the imported definitions internal, so that the
+ * pre-link optimization inlines and simplifies through them and drops the rest. */
+static bool
+link_device_builtin_bitcode(llvm::Module & M, const char * bc_path, std::string & err)
+{
+    llvm::StringSet<> had;
+    for (const llvm::Function & F : M)
+        if (!F.isDeclaration())
+            had.insert(F.getName());
+    if (!link_device_bitcode(M, bc_path, err))
+        return false;
+    for (llvm::Function & F : M)
+        if (!F.isDeclaration() && !had.contains(F.getName()) && !F.hasLocalLinkage())
+            F.setLinkage(llvm::GlobalValue::InternalLinkage);
+    return true;
+}
+
+/* Bring a device snapshot to its final IR: link the builtin libraries, SPMD-ize,
+ * link the device libraries, optimize. Everything before code generation. */
+static bool
+optimize_device_module(llvm::Module & M, llvm::TargetMachine * TM,
+                       const char * const * builtin_libs, size_t nbuiltin,
+                       const char * const * libs, size_t nlibs,
+                       const std::string & dump_dir, std::string & err)
+{
+    M.setTargetTriple(TM->getTargetTriple());
     M.setDataLayout(TM->createDataLayout());
 
-    scoped_phase_t _emit("dev-emit-total");
+    /* 0. Builtin libraries, before any optimization, as the ahead-of-time
+     * compiler links them into each device translation unit. Measured on
+     * LULESH / A100: with libdevice linked only after the pre-link stage,
+     * `sqrt` in the EOS kernel is an opaque convergent call during that stage,
+     * which pins the per-element work inside a loop the ahead-of-time pipeline
+     * proves redundant and deletes -- 2.5x the instructions, 3x the time. */
+    for (size_t i = 0 ; i < nbuiltin ; ++i)
+        if (builtin_libs[i] && builtin_libs[i][0] &&
+            !link_device_builtin_bitcode(M, builtin_libs[i], err))
+            return false;
 
     /* 1. Pre-link: SPMD-ize (and, under CGIR_JIT_DEVICE_LTO, optimize) the
      * generic-mode snapshot. Must precede the link -- see the function. */
     {
         scoped_phase_t _p("dev-spmdize");
-        optimize_device_module_prelink(M, TM.get());
+        optimize_device_module_prelink(M, TM);
     }
 
     if (!dump_dir.empty())
@@ -2735,20 +3027,26 @@ emit_device_ptx(llvm::Module & M, const char * triple, const char * arch,
      * PTX at cuModuleLoadData. CGIR_DEVICE_EXTRA_BC adds one more for debugging. */
     for (size_t i = 0 ; i < nlibs ; ++i)
         if (libs[i] && libs[i][0] && !link_device_bitcode(M, libs[i], err))
-            return {};
+            return false;
     if (const char * extra = getenv("CGIR_DEVICE_EXTRA_BC"); extra && extra[0])
         if (!link_device_bitcode(M, extra, err))
-            return {};
+            return false;
 
     /* 3. Post-link: O3 to AOT quality (inline runtime, fold config, DCE, vectorize). */
     {
         scoped_phase_t _p("dev-o3");
-        optimize_device_module_postlink(M, TM.get());
+        optimize_device_module_postlink(M, TM);
     }
 
     if (!dump_dir.empty())
         dump_module(dump_dir, "optimized.ll", M);
+    return true;
+}
 
+/* Emit PTX for a module already brought to its final IR. */
+static std::string
+codegen_device_ptx(llvm::Module & M, llvm::TargetMachine * TM, std::string & err)
+{
     llvm::SmallString<0> out;
     llvm::raw_svector_ostream os(out);
     llvm::legacy::PassManager pm;
@@ -2878,6 +3176,531 @@ setup_host_jit_symbols(llvm::orc::LLJIT & jit, const command_prog_t * prog)
 # endif /* CGIR_SUPPORT_LLVM */
 
 /* ---------------------------------------------------------------------------
+ * Device aliasing (CGIR_NOALIAS, see noalias-llvmir.hpp) for a JIT'd kernel:
+ * which of its pointer parameters get `noalias`. That attribute is what lets
+ * NVPTX use the read-only data path (`ld.global.nc`) for a parameter the kernel
+ * only reads, and what lets the optimizer reorder accesses across them.
+ * ------------------------------------------------------------------------- */
+
+/* What one instance of a kernel tells the analysis: the runtime value of each
+ * pointer parameter, of each integer parameter, and the launch dimensions. The
+ * values come from `prog->args`, the kernelParams array, whose slots are the
+ * offload plugin's pointer-sized argument array. */
+struct device_instance_t
+{
+    std::vector<noalias::base_t> bases;
+    std::vector<unsigned>        base_arg;   /* parameter index of each base */
+    noalias::env_t               env;
+    std::string                  values;     /* every known value, for cache keys */
+};
+
+/* Indices of the OpenMP launch-environment parameters (`dyn_ptr`) of `entry`:
+ * one for a target region, one per constituent for a kernel prog-fuse built
+ * (which stamps them "cgir.runtime-env"). Names are usually stripped from the
+ * forwarded bitcode; clang appends the launch environment as the last kernel
+ * parameter of an OpenMP offload kernel and marks it `noalias` -- an attribute
+ * it never puts on a mapped list item -- so that is how it is recognized when
+ * unnamed. Only reliable on the unoptimized snapshot: record it there and pass
+ * it along (see device_optimized_t::env_params). */
+typedef std::vector<unsigned> env_params_t;
+
+static env_params_t
+device_runtime_env_params(const llvm::Function & entry)
+{
+    env_params_t out;
+    for (const llvm::Argument & A : entry.args())
+        if (A.hasAttribute("cgir.runtime-env") || A.getName() == "dyn_ptr")
+            out.push_back(A.getArgNo());
+    if (out.empty() && entry.getParent()->getModuleFlag("openmp-device") && entry.arg_size() > 0)
+    {
+        const llvm::Argument * L = entry.getArg(entry.arg_size() - 1);
+        if (L->getType()->isPointerTy() && L->hasNoAliasAttr())
+            out.push_back(L->getArgNo());
+    }
+    return out;
+}
+
+static device_instance_t
+device_instance(llvm::Function & entry, const command_prog_t * prog,
+                const env_params_t * env_params = nullptr)
+{
+    const env_params_t envs = env_params ? *env_params : device_runtime_env_params(entry);
+    device_instance_t d;
+    for (llvm::Argument & A : entry.args())
+    {
+        const unsigned i = A.getArgNo();
+        llvm::Type *   T = A.getType();
+        if (prog->args == nullptr || i >= prog->n_args || prog->args[i] == nullptr)
+            continue ;
+        const bool ptr = T->isPointerTy();
+        const bool num = T->isIntegerTy() && T->getIntegerBitWidth() <= 64;
+        if (!ptr && !num)
+            continue ;
+        const size_t bytes = ptr ? sizeof(void *) : (T->getIntegerBitWidth() + 7) / 8;
+        uint64_t raw = 0;
+        memcpy(&raw, prog->args[i], bytes);
+        d.values.append(reinterpret_cast<const char *>(&i), sizeof(i));
+        d.values.append(reinterpret_cast<const char *>(&raw), sizeof(raw));
+        if (std::find(envs.begin(), envs.end(), i) != envs.end())
+            d.env.runtime_envs.push_back(&A);   /* an OpenMP launch environment */
+        else if (ptr)
+        {
+            d.bases.push_back({&A, raw});
+            d.base_arg.push_back(i);
+        }
+        else
+        {
+            const unsigned w = T->getIntegerBitWidth();
+            const int64_t  v = (w == 64) ? (int64_t) raw
+                             : (int64_t) (raw << (64 - w)) >> (64 - w);
+            d.env.consts[&A] = v;
+        }
+    }
+    const unsigned g[3] = { prog->grid.x,  prog->grid.y,  prog->grid.z  };
+    const unsigned b[3] = { prog->block.x, prog->block.y, prog->block.z };
+    for (int k = 0 ; k < 3 ; ++k)
+    {
+        d.env.grid[k]  = g[k];
+        d.env.block[k] = b[k];
+    }
+    d.values.append(reinterpret_cast<const char *>(g), sizeof(g));
+    d.values.append(reinterpret_cast<const char *>(b), sizeof(b));
+    d.env.globals_private = true;   /* the JIT'd module's globals are its own */
+    return d;
+}
+
+/* CGIR_NOALIAS=distinct-base: every pointer parameter whose value no other
+ * pointer parameter shares. */
+static std::vector<bool>
+device_noalias_distinct(const device_instance_t & d, size_t nparams)
+{
+    std::vector<bool> set(nparams, false);
+    for (size_t i = 0 ; i < d.bases.size() ; ++i)
+    {
+        bool unique = (d.bases[i].addr != 0);
+        for (size_t j = 0 ; unique && j < d.bases.size() ; ++j)
+            if (j != i && d.bases[j].addr == d.bases[i].addr)
+                unique = false;
+        if (unique)
+            set[d.base_arg[i]] = true;
+    }
+    return set;
+}
+
+/* Every pointer parameter the analysis of `entry` -- a kernel in its final,
+ * optimized form -- proves non-conflicting with everything else the kernel
+ * accesses. Under CGIR_NOALIAS_VERIFY, also checks the distinct-base set
+ * `assumed` (if any) against the same analysis. */
+/* Forward the OpenMP device runtime's block broadcasts, for the analysis only:
+ *
+ *       if (tid.x == 0) G = C;      // G a shared-memory global, C a constant
+ *       bar.sync (aligned)          // every thread of the block
+ *       ... = G;                    // reads C, in every thread
+ *
+ * The block barrier makes thread 0's store visible to the whole block, so the
+ * load is C provided nothing else stores to G between the barrier and it. The
+ * runtime publishes its team state this way at the start of every parallel
+ * region; OpenMPOpt folds it in the first body of a fused kernel, but not past
+ * a barrier marker, and the unfolded value then makes the next body's thread
+ * indices look data-dependent. Only this exact shape is recognized. */
+static void
+forward_block_broadcasts(llvm::Function & F)
+{
+    llvm::DominatorTree DT(F);
+    llvm::LoopInfo      LI(DT);
+    std::vector<std::pair<llvm::LoadInst *, llvm::Constant *>> fwd;
+    static const bool dbg = [] { const char * e = getenv("CGIR_NOALIAS_DEBUG"); return e && atoi(e) >= 3; }();
+    auto why = [&] (const char * w) { if (dbg) fprintf(stderr, "[cgir broadcast] not forwarded: %s\n", w); };
+
+    for (llvm::Instruction & I : llvm::instructions(F))
+    {
+        auto * L = llvm::dyn_cast<llvm::LoadInst>(&I);
+        if (L == nullptr || L->isVolatile() || L->isAtomic())
+            continue ;
+        auto * G = llvm::dyn_cast<llvm::GlobalVariable>(L->getPointerOperand());
+        if (G == nullptr || G->getAddressSpace() != 3)
+            continue ;
+
+        /* the aligned barrier immediately dominating the load, with no store
+         * to G in between along the dominator chain */
+        const llvm::IntrinsicInst * B = nullptr;
+        bool clobbered = false;
+        for (llvm::BasicBlock * BB = L->getParent() ; BB && !B && !clobbered ;
+             BB = DT.getNode(BB)->getIDom() ? DT.getNode(BB)->getIDom()->getBlock() : nullptr)
+        {
+            auto it = (BB == L->getParent()) ? L->getReverseIterator() : BB->rbegin();
+            for ( ; it != BB->rend() ; ++it)
+            {
+                if (&*it == L) continue;
+                if (auto * II = llvm::dyn_cast<llvm::IntrinsicInst>(&*it))
+                    if (II->getIntrinsicID() == llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all)
+                    { B = II; break; }
+                if (it->mayWriteToMemory() && !llvm::isa<llvm::IntrinsicInst>(&*it))
+                { clobbered = true; break; }
+            }
+        }
+        if (B == nullptr || clobbered || &B->getParent()->front() != B)
+        { why(B == nullptr ? "no barrier" : clobbered ? "clobbered" : "barrier not first"); continue ; }
+
+        /* the broadcast: BB(B) <- {S, Gd}, Gd: br (tid.x == 0), S, BB(B); S: store C, G */
+        llvm::BasicBlock * BBB = const_cast<llvm::BasicBlock *>(B->getParent());
+        llvm::BasicBlock * S = nullptr, * Gd = nullptr;
+        if (llvm::pred_size(BBB) != 2)
+        { why("preds != 2"); continue ; }
+        for (llvm::BasicBlock * P : llvm::predecessors(BBB))
+            (P->getSinglePredecessor() && llvm::isa<llvm::StoreInst>(P->front())) ? (S = P) : (Gd = P);
+        if (!S || !Gd || S->getSinglePredecessor() != Gd || S->size() != 2)
+        { why("shape"); continue ; }
+        auto * St = llvm::dyn_cast<llvm::StoreInst>(&S->front());
+        auto * C  = St ? llvm::dyn_cast<llvm::Constant>(St->getValueOperand()) : nullptr;
+        auto * Br = llvm::dyn_cast<llvm::BranchInst>(Gd->getTerminator());
+        if (!St || St->getPointerOperand() != G || !C || C->getType() != L->getType() ||
+            !Br || !Br->isConditional() || Br->getSuccessor(0) != S || Br->getSuccessor(1) != BBB)
+        { why("store/branch"); continue ; }
+        auto * Cmp = llvm::dyn_cast<llvm::ICmpInst>(Br->getCondition());
+        auto * Tid = Cmp ? llvm::dyn_cast<llvm::IntrinsicInst>(Cmp->getOperand(0)) : nullptr;
+        auto * Z   = Cmp ? llvm::dyn_cast<llvm::ConstantInt>(Cmp->getOperand(1)) : nullptr;
+        if (!Cmp || Cmp->getPredicate() != llvm::ICmpInst::ICMP_EQ || !Tid || !Z || !Z->isZero() ||
+            Tid->getIntrinsicID() != llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x)
+        { why("guard"); continue ; }
+
+        /* No other store to G between the barrier and the load: no store can
+         * reach the load without passing through the barrier. B opens its
+         * block, so every path entering that block passes through B; a store
+         * reaches L "after B" only from inside B's block (between B and L), or
+         * along a path that avoids B's block altogether. */
+        bool other = false;
+        llvm::SmallPtrSet<llvm::BasicBlock *, 1> through_b;
+        through_b.insert(BBB);
+        for (llvm::User * U : G->users())
+            if (auto * S2 = llvm::dyn_cast<llvm::StoreInst>(U))
+                if (S2 != St &&
+                    ((S2->getParent() == BBB && S2->comesBefore(L) && B->comesBefore(S2)) ||
+                     (S2->getParent() != BBB && L->getParent() != BBB &&
+                      llvm::isPotentiallyReachable(S2, L, &through_b, &DT, &LI))))
+                {
+                    other = true;
+                    if (dbg)
+                        fprintf(stderr, "[cgir broadcast]   store in %s (depth %u) reaches load in %s (depth %u)\n",
+                                S2->getParent()->getName().str().c_str(), LI.getLoopDepth(S2->getParent()),
+                                L->getParent()->getName().str().c_str(), LI.getLoopDepth(L->getParent()));
+                }
+        if (!other)
+            fwd.push_back({L, C});
+        else
+            why("other store reachable");
+    }
+    for (auto & f : fwd)
+    {
+        f.first->replaceAllUsesWith(f.second);
+        f.first->eraseFromParent();
+    }
+}
+
+/* A copy of `entry`'s module specialized for one instance, for the analysis
+ * only (the emitted code is never specialized): every integer parameter is
+ * replaced by its value and the launch dimensions by constants, the thread and
+ * block indices get their exact ranges, and a short cleanup folds what that
+ * enables. OpenMP worksharing loops keep their bounds in `umin` recurrences
+ * across the chunk loop, which ScalarEvolution sees as opaque phis; with the
+ * bounds constant they fold, and the trip counts become computable. */
+static std::unique_ptr<llvm::Module>
+device_specialize_for_analysis(llvm::Function & entry, const command_prog_t * prog,
+                               const env_params_t & env_params, llvm::TargetMachine * TM)
+{
+    std::unique_ptr<llvm::Module> C = llvm::CloneModule(*entry.getParent());
+    llvm::Function * F = C->getFunction(entry.getName());
+    const device_instance_t d = device_instance(*F, prog, &env_params);
+    for (auto & kv : d.env.consts)
+    {
+        llvm::Argument * A = const_cast<llvm::Argument *>(llvm::cast<llvm::Argument>(kv.first));
+        A->replaceAllUsesWith(llvm::ConstantInt::get(A->getType(), (uint64_t) kv.second, true));
+    }
+    const unsigned g[3] = { prog->grid.x,  prog->grid.y,  prog->grid.z  };
+    const unsigned b[3] = { prog->block.x, prog->block.y, prog->block.z };
+    std::vector<llvm::Instruction *> dead;
+    for (llvm::Instruction & I : llvm::instructions(*F))
+    {
+        auto * II = llvm::dyn_cast<llvm::IntrinsicInst>(&I);
+        if (II == nullptr) continue;
+        int dim = -1; bool count = false; const unsigned * src = nullptr;
+        switch (II->getIntrinsicID())
+        {
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_x:   dim = 0; count = true;  src = b; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_y:   dim = 1; count = true;  src = b; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_z:   dim = 2; count = true;  src = b; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_x: dim = 0; count = true;  src = g; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_y: dim = 1; count = true;  src = g; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_z: dim = 2; count = true;  src = g; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x:    dim = 0; count = false; src = b; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_tid_y:    dim = 1; count = false; src = b; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_tid_z:    dim = 2; count = false; src = b; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_ctaid_x:  dim = 0; count = false; src = g; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_ctaid_y:  dim = 1; count = false; src = g; break;
+            case llvm::Intrinsic::nvvm_read_ptx_sreg_ctaid_z:  dim = 2; count = false; src = g; break;
+            default: break;
+        }
+        if (dim < 0 || src[dim] == 0)
+            continue ;
+        llvm::Type * T = II->getType();
+        if (count)
+        {
+            II->replaceAllUsesWith(llvm::ConstantInt::get(T, src[dim]));
+            dead.push_back(II);
+        }
+        else
+        {
+            II->removeRetAttr(llvm::Attribute::Range);
+            II->setMetadata(llvm::LLVMContext::MD_range, nullptr);
+            II->addRangeRetAttr(llvm::ConstantRange(
+                llvm::APInt(T->getIntegerBitWidth(), 0),
+                llvm::APInt(T->getIntegerBitWidth(), src[dim])));
+        }
+    }
+    for (llvm::Instruction * I : dead)
+        I->eraseFromParent();
+
+    forward_block_broadcasts(*F);
+
+    run_module_passes(*C, TM, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+        if (llvm::Error err = PB.parsePassPipeline(MPM,
+                "function(sccp,instcombine,simplifycfg,early-cse,"
+                "loop-simplify,lcssa,loop(indvars),instcombine)"))
+            llvm::consumeError(std::move(err));
+    });
+    /* CGIR_NOALIAS_DUMP=dir: keep the specialized copies, to see what the
+     * analysis saw */
+    if (const char * d = getenv("CGIR_NOALIAS_DUMP"); d && d[0] == '/')
+    {
+        static std::atomic<unsigned> seq{0};
+        llvm::sys::fs::create_directories(d);
+        dump_module(d, (F->getName().str() + "." + std::to_string(seq++) + ".ll").c_str(), *C);
+    }
+    return C;
+}
+
+static std::vector<bool>
+device_noalias_proven(llvm::Function & entry, const command_prog_t * prog,
+                      const std::vector<bool> * assumed, const env_params_t & env_params,
+                      llvm::TargetMachine * TM)
+{
+    std::unique_ptr<llvm::Module> C = device_specialize_for_analysis(entry, prog, env_params, TM);
+    llvm::Function & SF = *C->getFunction(entry.getName());
+    const device_instance_t d = device_instance(SF, prog, &env_params);
+    const noalias::result_t r = noalias::analyze(SF, d.bases, d.env);
+
+    std::vector<bool> set(entry.arg_size(), false);
+    unsigned proven = 0, candidates = 0;
+
+    /* CGIR_NOALIAS_DEBUG=1: what the analysis saw, per pointer parameter */
+    static const bool debug = env_flag("CGIR_NOALIAS_DEBUG");
+    if (debug)
+    {
+        auto show = [] (const noalias::footprint_t & f) {
+            char b[96];
+            if (!f.accessed())     snprintf(b, sizeof(b), "-");
+            else if (!f.bounded)   snprintf(b, sizeof(b), "%s%s anywhere", f.ref ? "R" : "", f.mod ? "W" : "");
+            else                   snprintf(b, sizeof(b), "%s%s [%lld, %lld)", f.ref ? "R" : "", f.mod ? "W" : "",
+                                            (long long) f.lo, (long long) f.hi);
+            return std::string(b);
+        };
+        fprintf(stderr, "[cgir noalias] %s: %u accesses, unattributed: %s\n",
+                entry.getName().str().c_str(), r.accesses, show(r.unknown).c_str());
+        for (size_t i = 0 ; i < d.bases.size() ; ++i)
+            fprintf(stderr, "[cgir noalias]   param %u (%s) @%#llx: %s\n", d.base_arg[i],
+                    d.bases[i].v->getName().str().c_str(), (unsigned long long) d.bases[i].addr,
+                    show(r.base[i]).c_str());
+    }
+
+    for (size_t i = 0 ; i < d.bases.size() ; ++i)
+    {
+        const noalias::footprint_t & fi = r.base[i];
+        if (!fi.accessed())
+            continue ;
+        ++candidates;
+        bool ok = !noalias::may_conflict(fi, d.bases[i].addr, r.unknown, 0);
+        for (size_t j = 0 ; ok && j < d.bases.size() ; ++j)
+            if (j != i && noalias::may_conflict(fi, d.bases[i].addr, r.base[j], d.bases[j].addr))
+                ok = false;
+        if (ok)
+        {
+            set[d.base_arg[i]] = true;
+            ++proven;
+        }
+
+        if (assumed && (*assumed)[d.base_arg[i]])
+        {
+            const std::string kname = entry.getName().str();
+            for (size_t j = 0 ; j < d.bases.size() ; ++j)
+                if (j != i && (j > i || !(*assumed)[d.base_arg[j]]))
+                    noalias::report_assumption(
+                        kname + " params " + std::to_string(d.base_arg[i]) +
+                        "," + std::to_string(d.base_arg[j]),
+                        fi, d.bases[i].addr, r.base[j], d.bases[j].addr);
+            noalias::report_assumption(
+                kname + " param " + std::to_string(d.base_arg[i]) + " vs unattributed accesses",
+                fi, d.bases[i].addr, r.unknown, 0);
+        }
+    }
+    if (!assumed)
+        noalias::report_proven(proven, candidates);
+    return set;
+}
+
+/* The synchronization each barrier marker of `entry` -- a fused kernel in its
+ * final, optimized form -- needs for this instance: one character per marker
+ * ('0' none, '1' block, '2' grid), indexed by its "cgir.barrier" tag. Empty
+ * when there are no markers. Analysed on a copy specialized for the instance
+ * (see device_specialize_for_analysis), with noalias::barrier_requirements. */
+static std::string
+device_barrier_plan(llvm::Function & entry, const command_prog_t * prog,
+                    const env_params_t & env_params, llvm::TargetMachine * TM)
+{
+    const size_t n = tag_grid_barrier_markers(entry);
+    if (n == 0)
+        return std::string();
+    std::string plan(n, '2');
+
+    std::unique_ptr<llvm::Module> C = device_specialize_for_analysis(entry, prog, env_params, TM);
+    llvm::Function * SF = C->getFunction(entry.getName());
+    if (SF == nullptr)
+        return plan;
+    const unsigned tag = SF->getContext().getMDKindID("cgir.barrier");
+    std::vector<const llvm::Instruction *> ms;
+    std::vector<size_t> idx;
+    for (llvm::CallInst * CI : grid_barrier_markers(*SF))
+        if (llvm::MDNode * md = CI->getMetadata(tag))
+            if (const auto * k = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md->getOperand(0)))
+                if (k->getZExtValue() < n)
+                {
+                    ms.push_back(CI);
+                    idx.push_back(k->getZExtValue());
+                }
+    const device_instance_t d = device_instance(*SF, prog, &env_params);
+    const std::vector<noalias::barrier_t> req = noalias::barrier_requirements(*SF, ms, d.bases, d.env);
+    for (size_t i = 0 ; i < ms.size() ; ++i)
+        plan[idx[i]] = (char) ('0' + (int) req[i]);
+
+    static const bool debug = env_flag("CGIR_NOALIAS_DEBUG");
+    if (debug)
+        fprintf(stderr, "[cgir barriers] %s: %s (0 none, 1 block, 2 grid)\n",
+                entry.getName().str().c_str(), plan.c_str());
+    return plan;
+}
+
+/* Whether a fused device kernel can do without any grid barrier, for the
+ * values it is about to be replayed with -- the condition for fusing a chain
+ * whose grid cannot be shown co-resident. Runs the device pipeline on a copy
+ * of `fused` (the jit pass later does the same on the real thing, and reaches
+ * the same plan: same code, same values). `proto` gives the launch and the
+ * toolchain; `slots` the fused kernel's argument slots. */
+static bool
+fused_device_kernel_avoids_grid_barrier(const llvm::Module & fused, const command_prog_t * proto,
+                                        void ** slots, size_t nslots, std::string & why)
+{
+    std::string bc;
+    {
+        llvm::raw_string_ostream os(bc);
+        llvm::WriteBitcodeToFile(fused, os);
+    }
+    llvm::LLVMContext ctx;
+    auto M = llvm::parseBitcodeFile(llvm::MemoryBufferRef(bc, "fused"), ctx);
+    if (!M)
+    {
+        llvm::consumeError(M.takeError());
+        why = "the fused module could not be reloaded for analysis";
+        return false;
+    }
+    const auto & L = proto->source.content.llvmir;
+    std::string err;
+    size_t tagged = 0;
+    if (llvm::Function * E = (*M)->getFunction("__fused_wrapper"))
+        tagged = tag_grid_barrier_markers(*E);
+    auto TM = make_device_tm(L.triple, L.arch, device_features_of(**M), err);
+    if (!TM || !optimize_device_module(**M, TM.get(), L.device_builtin_libs, L.device_builtin_libs_count,
+                                       L.device_libs, L.device_libs_count, std::string(), err))
+    {
+        why = "the fused kernel could not be optimized for analysis: " + err;
+        return false;
+    }
+    llvm::Function * entry = (*M)->getFunction("__fused_wrapper");
+    if (entry == nullptr)
+    {
+        why = "the fused kernel has no entry";
+        return false;
+    }
+    if (grid_barrier_markers(*entry).size() != tagged)
+    {
+        why = "the optimizer dropped a barrier marker";
+        return false;
+    }
+    command_prog_t inst = *proto;
+    inst.args   = slots;
+    inst.n_args = nslots;
+    const std::string plan = device_barrier_plan(*entry, &inst, device_runtime_env_params(*entry), TM.get());
+    if (plan.find('2') != std::string::npos)
+    {
+        why = "a grid-wide barrier is needed (plan " + plan + ": a body reads what another "
+              "thread wrote before it)";
+        return false;
+    }
+    return true;
+}
+
+static std::string
+bitset_bytes(const std::vector<bool> & set)
+{
+    std::string s(set.size(), '0');
+    for (size_t i = 0 ; i < set.size() ; ++i)
+        if (set[i]) s[i] = '1';
+    return s;
+}
+
+/* A device kernel in its final, optimized form, before any noalias of ours was
+ * added, kept per program (cache_key) for the process lifetime: under
+ * CGIR_NOALIAS=prove (and to verify distinct-base) every instance is analysed
+ * against it, and the PTX is then emitted once per distinct noalias set rather
+ * than re-optimized per instance. */
+struct device_optimized_t
+{
+    std::unique_ptr<llvm::LLVMContext> ctx;
+    std::unique_ptr<llvm::Module>      mod;
+    std::string                        entry;
+    std::string                        features;
+    env_params_t                       env_params;   /* see device_runtime_env_params */
+};
+
+static std::mutex                                       device_optimized_mtx;
+static std::unordered_map<uint64_t, device_optimized_t> device_optimized;
+
+/* Add `noalias` to the parameters in `set` of `entry`; true iff any was new. */
+static bool
+add_noalias_params(llvm::Function & entry, const std::vector<bool> & set)
+{
+    bool changed = false;
+    for (llvm::Argument & A : entry.args())
+        if (A.getArgNo() < set.size() && set[A.getArgNo()] &&
+            A.getType()->isPointerTy() && !A.hasNoAliasAttr())
+        {
+            A.addAttr(llvm::Attribute::NoAlias);
+            changed = true;
+        }
+    return changed;
+}
+
+/* Re-run the scalar optimizations noalias enables on an already-optimized
+ * kernel (forwarding, LICM, dead stores); codegen then picks the read-only path. */
+static void
+reoptimize_after_noalias(llvm::Module & M, llvm::TargetMachine * TM)
+{
+    run_module_passes(M, TM, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+        if (llvm::Error err = PB.parsePassPipeline(MPM,
+                "function(early-cse<memssa>,gvn,loop-mssa(licm),dse,instcombine,simplifycfg)"))
+            llvm::consumeError(std::move(err));
+    });
+}
+
+/* ---------------------------------------------------------------------------
  * SECTION 5 - the jit pass entry point: resolve the entry, then hand it to the
  * device or host code generator above.
  * ------------------------------------------------------------------------- */
@@ -2907,7 +3730,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     /* Fast path (pre-parse): reuse a cached artifact directly. Device PTX (from
      * this process or a prior run on disk); host compiled function pointer (this
      * process only -- disk objects are loaded further down, needing the entry). */
-    if (is_device)
+    if (is_device && noalias::mode() == noalias::MODE_NONE && !prog->requires_coresident_grid)
     {
         std::string ptx;
         if (const int hit = cache_device_get(key, ptx))
@@ -2996,37 +3819,6 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
      * (source.symbol) at launch. The fast path above already handled cache hits. */
     if (is_device)
     {
-        /* Opt-in: assume the kernel's pointer parameters do not overlap.
-         *
-         * This is the one place the device JIT can beat the ahead-of-time
-         * toolchain on code quality. NVPTX lowers a load through a kernel
-         * parameter to `ld.global.nc` (the read-only data path) only when the
-         * parameter is BOTH readonly and noalias -- `readonly` the optimizer
-         * infers on its own, `noalias` it cannot, because an `omp target`'s
-         * mapped list items are not required to be distinct objects. The
-         * compiler must therefore give up on it; a runtime that knows which
-         * buffers a task actually touches does not have to. prog-fuse already
-         * makes exactly this assumption for the pointers it captures into a
-         * fused wrapper (command_graph_prog_fuse_llvmir, "distinct captured
-         * pointers are assumed non-overlapping").
-         *
-         * Off by default because it is an assumption about the program, not a
-         * deduction: enable it only when the mapped buffers of a target region
-         * are known to be disjoint. */
-        if (device_assume_noalias_params())
-        {
-            unsigned marked = 0;
-            for (llvm::Argument & A : entry->args())
-                if (A.getType()->isPointerTy() && !A.hasNoAliasAttr())
-                {
-                    A.addAttr(llvm::Attribute::NoAlias);
-                    ++marked;
-                }
-            if (marked && dump)
-                fprintf(stderr, "jit(device): assuming %u pointer parameters of `%s` do not alias\n",
-                        marked, entry->getName().str().c_str());
-        }
-
         /* Tell the PTX assembler how densely this kernel is actually going to be
          * co-scheduled, so it stops guessing.
          *
@@ -3070,30 +3862,279 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
                         entry->getName().str().c_str(), prog->blocks_per_sm);
         }
 
-        const char * dtriple = prog->source.content.llvmir.triple;
-        std::string perr;
-        std::string ptx = emit_device_ptx(*mod, dtriple,
-                                          prog->source.content.llvmir.arch,
-                                          prog->source.content.llvmir.device_libs,
-                                          prog->source.content.llvmir.device_libs_count,
-                                          dump ? dump_dir : std::string(), perr);
-        if (ptx.empty())
-        {
-            fprintf(stderr, "jit(device): PTX emission failed: %s\n", perr.c_str());
+        /* Which pointer parameters get `noalias` (CGIR_NOALIAS): the one place
+         * the device JIT can beat the ahead-of-time toolchain on aliasing.
+         * NVPTX lowers a load through a kernel parameter to `ld.global.nc` (the
+         * read-only data path) only when the parameter is BOTH readonly and
+         * noalias -- `readonly` the optimizer infers on its own, `noalias` it
+         * cannot, because an `omp target`'s mapped list items are not required
+         * to be distinct objects. A runtime that knows the values a recorded
+         * kernel is replayed with does not have to give up:
+         *
+         *   prove          analyse the kernel in its final form (only there
+         *                  are all its accesses visible: before the post-link
+         *                  O3 an outlined parallel region reaches its data
+         *                  through an args array) against this instance's
+         *                  values. The optimized module is kept per program and
+         *                  PTX is emitted per distinct proven set.
+         *   distinct-base  pointer parameters with distinct values are
+         *                  assumed disjoint; marked before the pipeline.
+         *   none           nothing.
+         *
+         * Either way the result depends on argument values, which the content
+         * key does not cover, so the artifact is keyed by key + the set. */
+        const noalias::policy_t nam      = noalias::mode();
+        const char *          dtriple  = prog->source.content.llvmir.triple;
+        const char *          darch    = prog->source.content.llvmir.arch;
+        const char * const *  dlibs    = prog->source.content.llvmir.device_libs;
+        const size_t          dnlibs   = prog->source.content.llvmir.device_libs_count;
+        const char * const *  dblibs   = prog->source.content.llvmir.device_builtin_libs;
+        const size_t          dnblibs  = prog->source.content.llvmir.device_builtin_libs_count;
+        const std::string     entry_name = entry->getName().str();
+        scoped_phase_t _emit("dev-emit-total");
+
+        auto fail = [] (const char * what, const std::string & err) {
+            fprintf(stderr, "jit(device): %s: %s\n", what, err.c_str());
             abort();
-        }
-        cache_device_put(key, ptx);
-        if (dump)
+        };
+        auto finish = [&] (const std::string & ptx, int outcome) {
+            if (dump)
+            {
+                std::string path = dump_dir + "/final.ptx";
+                std::error_code ec;
+                llvm::raw_fd_ostream f(path, ec, llvm::sys::fs::OF_Text);
+                if (!ec) f << ptx;
+            }
+            restore_device_ptx(prog, ptx);
+            if (profiling_stats_on()) profiling_cache_event(true, outcome);
+        };
+        /* The barrier plan of a fused kernel (see device_barrier_plan) decides
+         * what its markers lower to, so it is part of the artifact key, and of
+         * the launch: only a remaining grid barrier needs every block resident. */
+        std::string plan;
+        auto set_key = [&] (const std::vector<bool> & set) {
+            const std::string b = bitset_bytes(set) + "|" + plan;
+            return cache_key_extend(key, b.data(), b.size());
+        };
+        auto settle_residency = [&] () {
+            const bool grid = plan.find('2') != std::string::npos;
+            if (prog->requires_coresident_grid && !grid && dump)
+                fprintf(stderr, "jit(device): `%s` needs no grid-wide barrier (plan %s): "
+                                "ordinary launch\n", entry_name.c_str(), plan.c_str());
+            if (grid)
+            {
+                const uint64_t blocks = (uint64_t) prog->grid.x * prog->grid.y * prog->grid.z;
+                const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm &&
+                                      prog->blocks_per_sm != ~0u)
+                                   ? prog->max_coresident_blocks / prog->blocks_per_sm : 0;
+                if (nsm == 0 || blocks > nsm)
+                    fail("barriers", "a grid-wide barrier remains in `" + entry_name +
+                         "` but its grid cannot be shown resident (plan " + plan + ")");
+            }
+            prog->requires_coresident_grid = grid;
+        };
+        const bool fused_markers = (mod->getFunction(CGIR_GRID_BARRIER_MARKER) != nullptr);
+
+        /* Optimize `M` (owned by `C`) and keep it as the program's analysable
+         * form; returns the entry. Takes ownership. */
+        auto keep_optimized = [&] (std::unique_ptr<llvm::LLVMContext> C,
+                                   std::unique_ptr<llvm::Module> M) -> device_optimized_t & {
+            std::lock_guard<std::mutex> lk(device_optimized_mtx);
+            auto it = device_optimized.find(key);
+            if (it != device_optimized.end())
+                return it->second;
+            device_optimized_t o;
+            o.features = device_features_of(*M);
+            size_t nmarkers = 0;
+            if (llvm::Function * E = M->getFunction(entry_name))
+            {
+                o.env_params = device_runtime_env_params(*E);
+                nmarkers = tag_grid_barrier_markers(*E);
+            }
+            std::string err;
+            auto TM = make_device_tm(dtriple, darch, o.features, err);
+            if (!TM) fail("target", err);
+            if (!optimize_device_module(*M, TM.get(), dblibs, dnblibs, dlibs, dnlibs,
+                                        dump ? dump_dir : std::string(), err))
+                fail("optimize", err);
+            if (llvm::Function * E = M->getFunction(entry_name))
+                check_markers_survived(*E, nmarkers);
+            o.ctx   = std::move(C);
+            o.mod   = std::move(M);
+            o.entry = entry_name;
+            return device_optimized.emplace(key, std::move(o)).first->second;
+        };
+        auto lookup_optimized = [&] () -> device_optimized_t * {
+            std::lock_guard<std::mutex> lk(device_optimized_mtx);
+            auto it = device_optimized.find(key);
+            return it == device_optimized.end() ? nullptr : &it->second;
+        };
+
+        if (nam == noalias::MODE_PROVE)
         {
-            std::string path = dump_dir + "/final.ptx";
-            std::error_code ec;
-            llvm::raw_fd_ostream f(path, ec, llvm::sys::fs::OF_Text);
-            if (!ec) f << ptx;
+            /* A warm run knows this instance's set without the analysis. */
+            const device_instance_t inst = device_instance(*entry, prog);
+            const uint64_t vkey = cache_key_extend(key, inst.values.data(), inst.values.size());
+            std::string meta;
+            if (cache_meta_get(vkey, meta))
+            {
+                const size_t bar = meta.find('|');
+                const std::string bits = meta.substr(0, bar);
+                plan = (bar == std::string::npos) ? std::string() : meta.substr(bar + 1);
+                std::vector<bool> set(bits.size());
+                for (size_t i = 0 ; i < bits.size() ; ++i) set[i] = (bits[i] == '1');
+                std::string ptx;
+                if (const int hit = cache_device_get(set_key(set), ptx))
+                {
+                    settle_residency();
+                    finish(ptx, hit == 1 ? 1 : 2);
+                    return ;
+                }
+                plan.clear();
+            }
+
+            device_optimized_t * O = lookup_optimized();
+            if (O == nullptr)
+                O = &keep_optimized(std::move(ctx), std::move(mod));
+            llvm::Function * oentry = O->mod->getFunction(O->entry);
+            if (oentry == nullptr) fail("prove", "optimized entry vanished");
+
+            std::string err;
+            auto TM = make_device_tm(dtriple, darch, O->features, err);
+            if (!TM) fail("target", err);
+
+            /* A program the runtime may launch with fewer blocks must have its
+             * noalias facts hold for each grid it may get. */
+            std::vector<bool> set = device_noalias_proven(*oentry, prog, nullptr,
+                                                          O->env_params, TM.get());
+            if (prog->grid_flexible)
+            {
+                const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm)
+                                   ? prog->max_coresident_blocks / prog->blocks_per_sm : 0;
+                unsigned cand[CGIR_GRID_CANDIDATES_MAX];
+                const unsigned nc = command_prog_grid_candidates(prog->grid.x, nsm, cand);
+                for (unsigned c = 1 ; c < nc ; ++c)
+                {
+                    command_prog_t alt = *prog;
+                    alt.grid.x = cand[c];
+                    const std::vector<bool> s2 = device_noalias_proven(*oentry, &alt, nullptr,
+                                                                       O->env_params, TM.get());
+                    for (size_t i = 0 ; i < set.size() && i < s2.size() ; ++i)
+                        set[i] = set[i] && s2[i];
+                }
+            }
+            plan = device_barrier_plan(*oentry, prog, O->env_params, TM.get());
+            cache_meta_put(vkey, bitset_bytes(set) + "|" + plan);
+            const uint64_t skey = set_key(set);
+            settle_residency();
+
+            std::string ptx;
+            if (const int hit = cache_device_get(skey, ptx))
+            {
+                finish(ptx, hit == 1 ? 1 : 2);
+                return ;
+            }
+
+            std::unique_ptr<llvm::Module> M = llvm::CloneModule(*O->mod);
+            llvm::Function * mentry = M->getFunction(O->entry);
+            bool reopt = add_noalias_params(*mentry, set);
+            if (!plan.empty())
+            {
+                lower_grid_barrier_markers(*mentry, plan);
+                reopt |= (plan.find('0') != std::string::npos);
+            }
+            if (reopt)
+                reoptimize_after_noalias(*M, TM.get());
+            ptx = codegen_device_ptx(*M, TM.get(), err);
+            if (ptx.empty()) fail("PTX emission failed", err);
+            cache_device_put(skey, ptx);
+            finish(ptx, 0);
+            return ;
         }
-        restore_device_ptx(prog, ptx);
-        if (profiling_stats_on()) profiling_cache_event(true, 0);
+
+        /* none / distinct-base: one pipeline, attributes (if any) up front */
+        std::vector<bool> set(entry->arg_size(), false);
+        if (nam == noalias::MODE_DISTINCT_BASE)
+        {
+            const device_instance_t inst = device_instance(*entry, prog);
+            set = device_noalias_distinct(inst, entry->arg_size());
+
+            /* Verification analyses the kernel without the assumption: its own
+             * optimized copy, made once per program. */
+            if (noalias::verify())
+            {
+                device_optimized_t * O = lookup_optimized();
+                if (O == nullptr)
+                {
+                    auto C = std::make_unique<llvm::LLVMContext>();
+                    llvm::SmallString<0> bc;
+                    {
+                        llvm::raw_svector_ostream os(bc);
+                        llvm::WriteBitcodeToFile(*mod, os);
+                    }
+                    auto M = llvm::parseBitcodeFile(
+                        llvm::MemoryBufferRef(llvm::StringRef(bc.data(), bc.size()), "verify"), *C);
+                    if (!M) fail("verify", llvm::toString(M.takeError()));
+                    O = &keep_optimized(std::move(C), std::move(*M));
+                }
+                if (llvm::Function * oentry = O->mod->getFunction(O->entry))
+                {
+                    std::string err;
+                    auto TM = make_device_tm(dtriple, darch, O->features, err);
+                    if (!TM) fail("target", err);
+                    device_noalias_proven(*oentry, prog, &set, O->env_params, TM.get());
+                }
+            }
+
+            if (add_noalias_params(*entry, set) && dump)
+                fprintf(stderr, "jit(device): assuming the distinct pointer parameters of "
+                                "`%s` do not alias\n", entry_name.c_str());
+        }
+        /* A fused kernel's barrier plan needs its final form: optimize first,
+         * then look the artifact up (only code generation is saved). */
+        std::string err;
+        std::unique_ptr<llvm::TargetMachine> TM;
+        auto optimize = [&] () {
+            const std::string features = device_features_of(*mod);
+            TM = make_device_tm(dtriple, darch, features, err);
+            if (!TM) fail("target", err);
+            if (!optimize_device_module(*mod, TM.get(), dblibs, dnblibs, dlibs, dnlibs,
+                                        dump ? dump_dir : std::string(), err))
+                fail("optimize", err);
+        };
+        if (fused_markers)
+        {
+            const size_t nmarkers = tag_grid_barrier_markers(*entry);
+            optimize();
+            check_markers_survived(*entry, nmarkers);
+            plan = device_barrier_plan(*entry, prog, device_runtime_env_params(*entry), TM.get());
+            settle_residency();
+        }
+        const uint64_t skey = (nam == noalias::MODE_NONE && plan.empty()) ? key : set_key(set);
+        {
+            std::string ptx;
+            if (const int hit = cache_device_get(skey, ptx))
+            {
+                finish(ptx, hit == 1 ? 1 : 2);
+                return ;
+            }
+        }
+
+        if (!fused_markers)
+            optimize();
+        else if (!plan.empty())
+        {
+            lower_grid_barrier_markers(*entry, plan);
+            if (plan.find('0') != std::string::npos)
+                reoptimize_after_noalias(*mod, TM.get());
+        }
+        std::string ptx = codegen_device_ptx(*mod, TM.get(), err);
+        if (ptx.empty()) fail("PTX emission failed", err);
+        cache_device_put(skey, ptx);
+        finish(ptx, 0);
         return ;
     }
+
 
     /* The runtime launches a JIT'd PROG as `void(void**)` (VARIADIC) or, for a
      * packed body, `void(void*, size_t)` (PACKED). If the entry already has one

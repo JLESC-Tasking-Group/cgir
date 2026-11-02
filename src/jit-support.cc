@@ -43,6 +43,7 @@
  */
 
 # include "jit-support.hpp"
+# include "noalias-llvmir.hpp"
 
 # if CGIR_SUPPORT_LLVM
 
@@ -285,12 +286,23 @@ host_target_id(void)
     return id;
 }
 
-/* `CGIR_JIT_DEVICE_NOALIAS` -- see the use site in command_graph_jit_llvmir. It
- * changes the emitted code, so it is also folded into the JIT cache key. */
-static bool
-device_assume_noalias_params(void)
+/* `CGIR_JIT_VARIANT` -- see jit-support.hpp. Unknown values fall back to the
+ * default with a warning rather than silently picking a mode. */
+static jit::jit_variant_mode_t
+jit_variant_mode(void)
 {
-    static const bool value = env_flag("CGIR_JIT_DEVICE_NOALIAS");
+    static const jit::jit_variant_mode_t value = [] {
+        const char * e = getenv("CGIR_JIT_VARIANT");
+        if (e == nullptr || e[0] == '\0' || strcmp(e, "auto") == 0)
+            return jit::JIT_VARIANT_AUTO;
+        if (strcmp(e, "jit") == 0)
+            return jit::JIT_VARIANT_JIT;
+        if (strcmp(e, "aot") == 0)
+            return jit::JIT_VARIANT_AOT;
+        fprintf(stderr, "cgir: CGIR_JIT_VARIANT='%s' is not one of jit, aot, auto; "
+                        "using auto\n", e);
+        return jit::JIT_VARIANT_AUTO;
+    }();
     return value;
 }
 
@@ -370,7 +382,7 @@ jit_static_salt(void)
         /* codegen-affecting knobs must be part of the key, or the on-disk cache
          * would hand back PTX built under a different assumption */
         const char knobs[3] = {
-            (char) (device_assume_noalias_params()   ? 1 : 0),
+            (char) noalias::mode(),
             (char) (device_lto_pipeline()            ? 1 : 0),
             (char) (device_declare_min_ctas_per_sm() ? 1 : 0),
         };
@@ -455,6 +467,16 @@ jit_cache_key(const command_prog_t * prog)
                 const uint64_t d = jit_device_lib_salt(L.device_libs[i]);
                 h = jit_fnv1a_seed(h, &d, sizeof(d));
             }
+        /* builtin libraries too, and separately: the same file linked before
+         * or after the pre-link optimization gives different code */
+        const char sep = 'B';
+        h = jit_fnv1a_seed(h, &sep, 1);
+        for (size_t i = 0 ; L.device_builtin_libs && i < L.device_builtin_libs_count ; ++i)
+            if (L.device_builtin_libs[i] && L.device_builtin_libs[i][0])
+            {
+                const uint64_t d = jit_device_lib_salt(L.device_builtin_libs[i]);
+                h = jit_fnv1a_seed(h, &d, sizeof(d));
+            }
         /* When the occupancy target is declared to the assembler (as
          * `.minnctapersm`, see command_graph_jit_llvmir) it sizes the register
          * budget, so it is part of the emitted PTX and not merely of how that
@@ -508,6 +530,7 @@ struct jit_cache_t
     std::mutex                                 mtx;
     std::unordered_map<uint64_t, host_entry_t> host;        // in-process fn ptr
     std::unordered_map<uint64_t, std::string>  device_ptx;  // in-process PTX
+    std::unordered_map<uint64_t, std::string>  meta;        // in-process derived facts
 
     jit_cache_t()
     {
@@ -617,6 +640,30 @@ struct jit_cache_t
         { std::lock_guard<std::mutex> lk(mtx); device_ptx[k] = ptx; }
         if (disk_write) write_file_atomic(path_for(k, "ptx"), ptx);
     }
+
+    // ---- small derived facts (e.g. a proven noalias set), mem + disk ----
+    bool meta_get(uint64_t k, std::string & out)
+    {
+        if (!enabled) return false;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            auto it = meta.find(k);
+            if (it != meta.end()) { out = it->second; return true; }
+        }
+        if (disk_read && read_file(path_for(k, "meta"), out))
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            meta[k] = out;
+            return true;
+        }
+        return false;
+    }
+    void meta_put(uint64_t k, const std::string & v)
+    {
+        if (!enabled) return ;
+        { std::lock_guard<std::mutex> lk(mtx); meta[k] = v; }
+        if (disk_write) write_file_atomic(path_for(k, "meta"), v);
+    }
 };
 
 static jit_cache_t &
@@ -645,10 +692,10 @@ CGIR_NAMESPACE::jit::env_str(const char * var, const char * dflt)
     return ::env_str(var, dflt);
 }
 
-bool
-CGIR_NAMESPACE::jit::device_assume_noalias_params(void)
+CGIR_NAMESPACE::jit::jit_variant_mode_t
+CGIR_NAMESPACE::jit::jit_variant_mode(void)
 {
-    return ::device_assume_noalias_params();
+    return ::jit_variant_mode();
 }
 
 bool
@@ -732,6 +779,24 @@ void
 CGIR_NAMESPACE::jit::cache_device_put(uint64_t key, const std::string & ptx)
 {
     jit_cache().device_put(key, ptx);
+}
+
+bool
+CGIR_NAMESPACE::jit::cache_meta_get(uint64_t key, std::string & out)
+{
+    return jit_cache().meta_get(key, out);
+}
+
+void
+CGIR_NAMESPACE::jit::cache_meta_put(uint64_t key, const std::string & v)
+{
+    jit_cache().meta_put(key, v);
+}
+
+uint64_t
+CGIR_NAMESPACE::jit::cache_key_extend(uint64_t key, const void * data, size_t n)
+{
+    return jit_fnv1a_seed(key ^ 0x9e3779b97f4a7c15ULL, data, n);
 }
 
 # endif /* CGIR_SUPPORT_LLVM */

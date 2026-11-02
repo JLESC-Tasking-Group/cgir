@@ -190,6 +190,19 @@ typedef struct  cgir_command_prog_source_t
             const char * const * device_libs;
             size_t               device_libs_count;
 
+            /* Device bitcode libraries linked into the program BEFORE it is
+             * optimized, as clang's -mlink-builtin-bitcode does when compiling a
+             * device translation unit (e.g. NVIDIA's libdevice): only the
+             * functions the program references are imported, and they are
+             * internalized, so the optimizer sees through them -- a libdevice
+             * __nv_sqrt becomes a speculatable intrinsic instead of an opaque,
+             * convergent call that pins the code around it. `device_libs` above
+             * are linked after the pre-link optimization instead, as a device
+             * linker would (the OpenMP DeviceRTL must arrive after
+             * SPMD-ization). NULL/0 => none. Non-owning. */
+            const char * const * device_builtin_libs;
+            size_t               device_builtin_libs_count;
+
             /* prototype (ABI) of the entry function within `raw` (see enum). */
             cgir_command_prog_source_proto_t proto;
 

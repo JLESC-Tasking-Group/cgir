@@ -141,6 +141,15 @@ typedef enum   command_prog_function_prototype_t
 
 }              command_prog_function_prototype_t;
 
+/* Which implementation of a program with two of them the runtime launches (see
+ * command_prog_t::aot_variant). Written by the runtime, read by nobody else. */
+typedef enum   command_prog_variant_t
+{
+    CGIR_COMMAND_PROG_VARIANT_UNDECIDED = 0,    /* still being measured */
+    CGIR_COMMAND_PROG_VARIANT_JIT,              /* the JIT'd code won */
+    CGIR_COMMAND_PROG_VARIANT_AOT               /* the ahead-of-time code won */
+}              command_prog_variant_t;
+
 /* a prog to be submitted via (cuKernelLaunch, ...) */
 struct command_prog_t
 {
@@ -303,7 +312,73 @@ struct command_prog_t
      * (cuLaunchCooperativeKernel), which is what makes that guarantee; launching
      * it like an ordinary kernel risks a hang. */
     bool requires_coresident_grid;
+
+    /* The ahead-of-time implementation of a device program the `jit` pass
+     * recompiled, kept beside the JIT'd one so the runtime can measure both and
+     * launch the faster (CGIR_JIT_VARIANT=auto, the default).
+     *
+     * Recompiling a kernel is not a guaranteed win. The JIT sees the actual
+     * occupancy, the actual argument values and the actual aliasing, but it
+     * also runs a different pipeline than the ahead-of-time toolchain, and
+     * neither dominates kernel by kernel (measured on LULESH / A100: the JIT
+     * won 14 of 21 kernels, lost 5, and one by 2.7x). Keeping both and
+     * choosing by measurement makes the pass never slower than not running it,
+     * up to measurement noise.
+     *
+     * `fn` is the kernel handle the program held before the pass (NULL: there
+     * is no alternative -- the program was never compiled ahead of time, e.g.
+     * it was synthesized by prog-fuse -- or the mode is not `auto`), and
+     * `dyn_shmem` the dynamic shared memory it was launched with, which the
+     * runtime may since have changed for the JIT'd code (see blocks_per_sm).
+     * Both variants take the same `args`: the JIT recompiles the very same
+     * kernel, so its signature is unchanged.
+     *
+     * For a host program the ahead-of-time implementation is the recorded
+     * OpenMP task routine (`kmp_fn`, `kmp_task`, launched under the KMP
+     * prototype), which the JIT'd program does not need: switching between the
+     * two is switching the prototype and the launcher.
+     *
+     * `selected` belongs to the runtime (see command_prog_variant_t); cgir only
+     * initializes it. */
+    struct {
+        void (*fn)(void ** args);                /* device kernel handle */
+        unsigned int dyn_shmem;
+        int  (*kmp_fn)(int gtid, void * task);   /* host task routine */
+        void * kmp_task;
+        command_prog_variant_t selected;
+    } aot_variant;
+
+    /* Whether the program is correct for any number of blocks (teams) in x up
+     * to the recorded `grid.x`, so that the runtime may launch it with fewer.
+     * Set by a producer that knows it: an OpenMP target region without a
+     * `num_teams` clause has an implementation-defined team count, which the
+     * program must not depend on. The runtime picks among
+     * command_prog_grid_candidates() by measurement -- fewer teams make the
+     * OpenMP teams reduction far cheaper (measured 2.9x on a dot product).
+     * cgir, which proves noalias facts for the recorded launch, makes them
+     * hold for every candidate. False for a fused program (its barrier plan is
+     * proven for one grid) and by default. */
+    bool grid_flexible;
 };
+
+/* The grid sizes (in x) a runtime may try for a grid_flexible program
+ * recorded with `grid_x` blocks, on a device with `nsm` multiprocessors: the
+ * recorded size, and k*nsm for k in {1,2,4,8,16} when smaller. Shared by cgir
+ * (which proves its facts for all of them) and the runtime (which picks one),
+ * so the two cannot disagree. Returns how many were written to `out` (at most
+ * CGIR_GRID_CANDIDATES_MAX); the first is always `grid_x`. */
+# define CGIR_GRID_CANDIDATES_MAX 6
+static inline unsigned int
+command_prog_grid_candidates(unsigned int grid_x, unsigned int nsm,
+                             unsigned int out[CGIR_GRID_CANDIDATES_MAX])
+{
+    unsigned int n = 0;
+    out[n++] = grid_x;
+    for (unsigned int k = 1 ; nsm && k <= 16 && n < CGIR_GRID_CANDIDATES_MAX ; k *= 2)
+        if (k * nsm < grid_x)
+            out[n++] = k * nsm;
+    return n;
+}
 
 /* read/write files */
 struct command_file_t
@@ -394,6 +469,8 @@ struct command_t
             prog.source.content.llvmir.arch           = nullptr;
             prog.source.content.llvmir.device_libs       = nullptr;
             prog.source.content.llvmir.device_libs_count = 0;
+            prog.source.content.llvmir.device_builtin_libs       = nullptr;
+            prog.source.content.llvmir.device_builtin_libs_count = 0;
             prog.source.content.llvmir.proto          = CGIR_COMMAND_PROG_SOURCE_PROTO_UNPACKED_PARAMS;
             prog.source.content.llvmir.params         = nullptr;
             prog.source.content.llvmir.param_count    = 0;
@@ -424,6 +501,13 @@ struct command_t
              * barrier and needs no special launch. Both are the safe defaults. */
             prog.max_coresident_blocks   = 0;
             prog.requires_coresident_grid = false;
+            /* no alternative implementation until the jit pass keeps one */
+            prog.aot_variant.fn        = nullptr;
+            prog.aot_variant.dyn_shmem = 0;
+            prog.aot_variant.kmp_fn    = nullptr;
+            prog.aot_variant.kmp_task  = nullptr;
+            prog.aot_variant.selected  = CGIR_COMMAND_PROG_VARIANT_UNDECIDED;
+            prog.grid_flexible         = false;
         }
     }
 };
