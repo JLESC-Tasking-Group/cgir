@@ -180,6 +180,15 @@ std::vector<barrier_t> barrier_requirements(llvm::Function & F,
                                             const std::vector<const llvm::Instruction *> & markers,
                                             const std::vector<base_t> & bases, const env_t & env);
 
+/* Whether no two threads of `F` ever communicate through memory: every pair of
+ * conflicting accesses in the kernel (an access with itself included, as two
+ * threads execute it) is provably made by one thread, by the same rule as a
+ * NONE barrier above, and no shared memory, runtime scratch, module global or
+ * unknown memory is written. Then no block barrier in `F` orders anything
+ * another thread can observe, and all of them may go -- which, between two
+ * fused bodies, lets their loops merge. */
+bool thread_independent(llvm::Function & F, const std::vector<base_t> & bases, const env_t & env);
+
 /* Verification and statistics (printed at exit when CGIR_NOALIAS_VERIFY is set). */
 void report_proven(unsigned proven, unsigned candidates);
 /* An assumption made under distinct-base, checked: `what` names the pair. */

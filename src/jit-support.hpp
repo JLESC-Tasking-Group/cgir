@@ -96,6 +96,7 @@ bool device_lto_pipeline(void);
  * out. Read once; folded into the cache key, since it changes the code. */
 bool device_declare_min_ctas_per_sm(void);
 
+
 /* ---------------------------------------------------------------------------
  * Opt-in profiling. Off (and near-free) unless enabled via env, read once at
  * first use:

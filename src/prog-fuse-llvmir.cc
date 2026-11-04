@@ -81,6 +81,8 @@
 # include <llvm/Analysis/InlineCost.h>
 # include <llvm/Analysis/CFG.h>
 # include <llvm/Analysis/LoopInfo.h>
+# include <llvm/ADT/SmallPtrSet.h>
+# include <llvm/Transforms/Utils/BasicBlockUtils.h>
 # include <llvm/IR/CFG.h>
 # include <llvm/IR/Dominators.h>
 # include <llvm/Analysis/MemoryLocation.h>
@@ -120,6 +122,15 @@
 /* Optimization pipeline (inline + loop-fuse + vectorize) run on the fused
  * module before JIT, so noalias/dedup actually translate into fused loops. */
 # include <llvm/Passes/PassBuilder.h>
+# include <llvm/Config/llvm-config.h>
+
+/* A PassBuilder `PB` for target machine `TM`: LLVM 24 also takes the context
+ * of module `M`, whose library options the pipelines read. */
+# if LLVM_VERSION_MAJOR >= 24
+#  define CGIR_PASS_BUILDER(PB, M, TM) llvm::PassBuilder PB((M).getContext(), (TM))
+# else
+#  define CGIR_PASS_BUILDER(PB, M, TM) llvm::PassBuilder PB((TM))
+# endif
 # include <llvm/Passes/OptimizationLevel.h>
 # include <llvm/Transforms/Scalar/LoopFuse.h>
 # include <llvm/Transforms/Scalar/LoopPassManager.h>
@@ -942,7 +953,7 @@ optimize_module(llvm::Module & M, llvm::TargetMachine * tm, const std::string & 
                 const std::vector<void *> * slot_addr = nullptr,
                 const std::vector<size_t> * slot_size = nullptr)
 {
-    llvm::PassBuilder PB(tm);
+    CGIR_PASS_BUILDER(PB, M, tm);
 
     llvm::LoopAnalysisManager     LAM;
     llvm::FunctionAnalysisManager FAM;
@@ -1251,6 +1262,23 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 coresident_why = "its grid of " + std::to_string(blocks) + " blocks exceeds the " +
                                  std::to_string(nsm) + " multiprocessors, a fused kernel is only "
                                  "guaranteed one resident block each";
+        }
+
+        /* CGIR_PROG_FUSE_GRID_BARRIER=0: fuse device programs only when no
+         * grid-wide barrier remains between them. A grid barrier makes the
+         * fused kernel a cooperative launch that must fit the device at once,
+         * synchronizes every block between the bodies, and runs at the lowest
+         * occupancy of its constituents -- which can cost more than the launches
+         * fusion saves (LULESH: the fused kernels take 1.7x the time of the
+         * kernels they replace). */
+        static const bool allow_grid_barrier = [] {
+            const char * e = getenv("CGIR_PROG_FUSE_GRID_BARRIER");
+            return !(e && e[0] == '0');
+        }();
+        if (!allow_grid_barrier && !grid_barrier_must_vanish)
+        {
+            grid_barrier_must_vanish = true;
+            coresident_why = "CGIR_PROG_FUSE_GRID_BARRIER=0";
         }
     }
 
@@ -2558,8 +2586,17 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      * learns it has to honour it. */
     dst->max_coresident_blocks    = progs[0]->max_coresident_blocks;
     dst->requires_coresident_grid = device;
-    /* A fused program's barrier plan is proven for its recorded grid. */
-    dst->grid_flexible = false;
+    /* The runtime may still tune the grid of a fused program whose every
+     * constituent allowed it: the jit pass proves its barrier plan, noalias
+     * facts and thread independence for each grid it may get
+     * (device_launch_grids), and a remaining grid barrier disables tuning
+     * (requires_coresident_grid). */
+    {
+        bool flexible = true;
+        for (size_t i = 0 ; i < n ; ++i)
+            flexible = flexible && progs[i]->grid_flexible;
+        dst->grid_flexible = flexible;
+    }
     /* A fused program has no ahead-of-time counterpart to fall back to. */
     dst->aot_variant.fn        = nullptr;
     dst->aot_variant.dyn_shmem = 0;
@@ -2718,7 +2755,7 @@ template <typename BuildFn>
 static void
 run_module_passes(llvm::Module & M, llvm::TargetMachine * tm, BuildFn && body)
 {
-    llvm::PassBuilder PB(tm);
+    CGIR_PASS_BUILDER(PB, M, tm);
 
     llvm::LoopAnalysisManager     LAM;
     llvm::FunctionAnalysisManager FAM;
@@ -2797,6 +2834,73 @@ optimize_device_module_prelink(llvm::Module & M, llvm::TargetMachine * tm)
  * because it is cheaper: simplifying before the link costs less in the pre-link
  * stage than it saves in the post-link one (measure with CGIR_JIT_TIMING=1 --
  * the two stages are the dev-spmdize and dev-o3 buckets). */
+/* Declare the block size `prog` is launched with as exact: `nvvm.reqntid` on
+ * the kernel (which the PTX then requires), replacing the `nvvm.maxntid` upper
+ * bound. A recorded command is replayed with its recorded block, so its code
+ * may depend on it. See fold_exact_block_size for what it buys. */
+static void
+declare_exact_block_size(llvm::Function & F, const command_prog_t * prog)
+{
+    if (prog->block.x == 0)
+        return ;
+    F.removeFnAttr("nvvm.maxntid");   /* ptxas: conflicts with .reqntid */
+    F.addFnAttr("nvvm.reqntid", std::to_string(prog->block.x) + "," +
+                                std::to_string(prog->block.y ? prog->block.y : 1) + "," +
+                                std::to_string(prog->block.z ? prog->block.z : 1));
+}
+
+/* After the DeviceRTL is linked: when the module's only kernel declares an
+ * exact block size (nvvm.reqntid), every read of the block size in the module
+ * -- the kernel and the runtime functions it calls -- is that constant.
+ * Replace them, so that the post-link pipeline folds and unrolls what depends
+ * on it: notably the runtime's intra-block reduction loops (over warps), which
+ * the ahead-of-time compile gets unrolled from the kernel environment's
+ * MaxThreads. (NVVMIntrRange, which would turn reqntid into ranges, only runs
+ * at pipeline start, before the runtime is linked.) */
+static void
+fold_exact_block_size(llvm::Module & M)
+{
+    llvm::Function * K = nullptr;
+    for (llvm::Function & F : M)
+        if (!F.isDeclaration() && F.hasKernelCallingConv())
+        {
+            if (K)
+                return ;   /* several kernels: block sizes may differ */
+            K = &F;
+        }
+    if (K == nullptr || !K->hasFnAttribute("nvvm.reqntid"))
+        return ;
+    unsigned dim[3] = { 1, 1, 1 };
+    llvm::StringRef v = K->getFnAttribute("nvvm.reqntid").getValueAsString();
+    for (int i = 0 ; i < 3 && !v.empty() ; ++i)
+    {
+        auto [first, rest] = v.split(',');
+        first.trim().getAsInteger(0, dim[i]);
+        v = rest;
+    }
+    std::vector<llvm::IntrinsicInst *> dead;
+    for (llvm::Function & F : M)
+        for (llvm::Instruction & I : llvm::instructions(F))
+            if (auto * II = llvm::dyn_cast<llvm::IntrinsicInst>(&I))
+            {
+                int d = -1;
+                switch (II->getIntrinsicID())
+                {
+                    case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_x: d = 0; break;
+                    case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_y: d = 1; break;
+                    case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_z: d = 2; break;
+                    default: break;
+                }
+                if (d >= 0)
+                {
+                    II->replaceAllUsesWith(llvm::ConstantInt::get(II->getType(), dim[d]));
+                    dead.push_back(II);
+                }
+            }
+    for (llvm::IntrinsicInst * II : dead)
+        II->eraseFromParent();
+}
+
 static void
 optimize_device_module_postlink(llvm::Module & M, llvm::TargetMachine * tm)
 {
@@ -2815,6 +2919,7 @@ optimize_device_module_postlink(llvm::Module & M, llvm::TargetMachine * tm)
             return F->hasKernelCallingConv();
         return false;
     });
+    fold_exact_block_size(M);
 
     run_module_passes(M, tm, [] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
         if (!device_lto_pipeline())
@@ -3353,9 +3458,9 @@ forward_block_broadcasts(llvm::Function & F)
         { why("shape"); continue ; }
         auto * St = llvm::dyn_cast<llvm::StoreInst>(&S->front());
         auto * C  = St ? llvm::dyn_cast<llvm::Constant>(St->getValueOperand()) : nullptr;
-        auto * Br = llvm::dyn_cast<llvm::BranchInst>(Gd->getTerminator());
+        auto * Br = llvm::dyn_cast<llvm::CondBrInst>(Gd->getTerminator());
         if (!St || St->getPointerOperand() != G || !C || C->getType() != L->getType() ||
-            !Br || !Br->isConditional() || Br->getSuccessor(0) != S || Br->getSuccessor(1) != BBB)
+            !Br || Br->getSuccessor(0) != S || Br->getSuccessor(1) != BBB)
         { why("store/branch"); continue ; }
         auto * Cmp = llvm::dyn_cast<llvm::ICmpInst>(Br->getCondition());
         auto * Tid = Cmp ? llvm::dyn_cast<llvm::IntrinsicInst>(Cmp->getOperand(0)) : nullptr;
@@ -3413,8 +3518,32 @@ device_specialize_for_analysis(llvm::Function & entry, const command_prog_t * pr
     const device_instance_t d = device_instance(*F, prog, &env_params);
     for (auto & kv : d.env.consts)
     {
-        llvm::Argument * A = const_cast<llvm::Argument *>(llvm::cast<llvm::Argument>(kv.first));
-        A->replaceAllUsesWith(llvm::ConstantInt::get(A->getType(), (uint64_t) kv.second, true));
+        auto * A = const_cast<llvm::Argument *>(llvm::dyn_cast<llvm::Argument>(kv.first));
+        if (A == nullptr || !A->getType()->isIntegerTy())
+            continue;
+        /* a floating-point scalar passed as integer bits (e.g. a solver's
+         * alpha) is data, not shape: leave it a parameter */
+        bool shape = true;
+        llvm::SmallVector<const llvm::Value *, 8> work{ A };
+        llvm::SmallPtrSet<const llvm::Value *, 8> seen;
+        while (shape && !work.empty())
+        {
+            const llvm::Value * V = work.pop_back_val();
+            if (!seen.insert(V).second)
+                continue;
+            for (const llvm::User * U : V->users())
+            {
+                if (llvm::isa<llvm::BitCastInst>(U) || llvm::isa<llvm::IntToPtrInst>(U) ||
+                    llvm::isa<llvm::StoreInst>(U) ||
+                    (llvm::isa<llvm::CallBase>(U) && !llvm::isa<llvm::IntrinsicInst>(U)))
+                    shape = false;
+                else if (llvm::isa<llvm::TruncInst>(U) || llvm::isa<llvm::ZExtInst>(U) ||
+                         llvm::isa<llvm::SExtInst>(U) || llvm::isa<llvm::InsertValueInst>(U))
+                    work.push_back(U);
+            }
+        }
+        if (shape)
+            A->replaceAllUsesWith(llvm::ConstantInt::get(A->getType(), (uint64_t) kv.second, true));
     }
     const unsigned g[3] = { prog->grid.x,  prog->grid.y,  prog->grid.z  };
     const unsigned b[3] = { prog->block.x, prog->block.y, prog->block.z };
@@ -3547,6 +3676,11 @@ device_noalias_proven(llvm::Function & entry, const command_prog_t * prog,
     return set;
 }
 
+static std::vector<unsigned> device_launch_grids(const command_prog_t * prog);
+static std::string device_barrier_plan_for(llvm::Function & entry, const command_prog_t * prog,
+                                           const env_params_t & env_params, llvm::TargetMachine * TM,
+                                           size_t n);
+
 /* The synchronization each barrier marker of `entry` -- a fused kernel in its
  * final, optimized form -- needs for this instance: one character per marker
  * ('0' none, '1' block, '2' grid), indexed by its "cgir.barrier" tag. Empty
@@ -3559,8 +3693,28 @@ device_barrier_plan(llvm::Function & entry, const command_prog_t * prog,
     const size_t n = tag_grid_barrier_markers(entry);
     if (n == 0)
         return std::string();
-    std::string plan(n, '2');
+    std::string plan(n, '0');
+    for (unsigned g : device_launch_grids(prog))
+    {
+        command_prog_t alt = *prog;
+        alt.grid.x = g;
+        const std::string p = device_barrier_plan_for(entry, &alt, env_params, TM, n);
+        for (size_t i = 0 ; i < n ; ++i)
+            plan[i] = std::max(plan[i], p[i]);
+    }
+    static const bool debug = env_flag("CGIR_NOALIAS_DEBUG");
+    if (debug)
+        fprintf(stderr, "[cgir barriers] %s: %s (0 none, 1 block, 2 grid)\n",
+                entry.getName().str().c_str(), plan.c_str());
+    return plan;
+}
 
+/* device_barrier_plan for one launch (one grid) */
+static std::string
+device_barrier_plan_for(llvm::Function & entry, const command_prog_t * prog,
+                        const env_params_t & env_params, llvm::TargetMachine * TM, size_t n)
+{
+    std::string plan(n, '2');
     std::unique_ptr<llvm::Module> C = device_specialize_for_analysis(entry, prog, env_params, TM);
     llvm::Function * SF = C->getFunction(entry.getName());
     if (SF == nullptr)
@@ -3580,11 +3734,6 @@ device_barrier_plan(llvm::Function & entry, const command_prog_t * prog,
     const std::vector<noalias::barrier_t> req = noalias::barrier_requirements(*SF, ms, d.bases, d.env);
     for (size_t i = 0 ; i < ms.size() ; ++i)
         plan[idx[i]] = (char) ('0' + (int) req[i]);
-
-    static const bool debug = env_flag("CGIR_NOALIAS_DEBUG");
-    if (debug)
-        fprintf(stderr, "[cgir barriers] %s: %s (0 none, 1 block, 2 grid)\n",
-                entry.getName().str().c_str(), plan.c_str());
     return plan;
 }
 
@@ -3647,6 +3796,257 @@ fused_device_kernel_avoids_grid_barrier(const llvm::Module & fused, const comman
     return true;
 }
 
+/* The grids a launch of `prog` may get: the recorded one, plus the runtime's
+ * candidates when it is grid_flexible (see command_prog_grid_candidates). A
+ * fact the JIT bakes into the code must hold for all of them. */
+static std::vector<unsigned>
+device_launch_grids(const command_prog_t * prog)
+{
+    if (!prog->grid_flexible)
+        return { prog->grid.x };
+    const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm &&
+                          prog->blocks_per_sm != ~0u)
+                       ? prog->max_coresident_blocks / prog->blocks_per_sm : 0;
+    unsigned cand[CGIR_GRID_CANDIDATES_MAX];
+    const unsigned n = command_prog_grid_candidates(prog->grid.x, nsm, cand);
+    return std::vector<unsigned>(cand, cand + n);
+}
+
+/* Whether `entry` (final form) is thread-independent for this instance, on
+ * every grid it may be launched with (see noalias::thread_independent). */
+static bool
+device_thread_independent(llvm::Function & entry, const command_prog_t * prog,
+                          const env_params_t & env_params, llvm::TargetMachine * TM)
+{
+    for (unsigned g : device_launch_grids(prog))
+    {
+        command_prog_t alt = *prog;
+        alt.grid.x = g;
+        std::unique_ptr<llvm::Module> C = device_specialize_for_analysis(entry, &alt, env_params, TM);
+        llvm::Function * SF = C->getFunction(entry.getName());
+        if (SF == nullptr)
+            return false;
+        const device_instance_t d = device_instance(*SF, &alt, &env_params);
+        if (!noalias::thread_independent(*SF, d.bases, d.env))
+            return false;
+    }
+    return true;
+}
+
+/* Rewrite `addrspacecast (gep %base, idx...) to AS` as
+ * `gep (addrspacecast %base to AS), idx...`, with one cast of each base, in the
+ * entry block, when %base is a function argument. The kernel's global
+ * accesses come out of the NVPTX lowering in the first form, where every cast
+ * is an opaque value to ScalarEvolution: two loops' accesses to y[i] then have
+ * unrelated bases, and loop-fusion cannot see that they are the same address.
+ * In the second form both are {y,+,8} over one base. Same addresses, same
+ * semantics (a gep commutes with a cast between address spaces of one width).
+ * Returns whether something changed. */
+static bool
+hoist_argument_casts(llvm::Function & F)
+{
+    llvm::DenseMap<std::pair<llvm::Value *, unsigned>, llvm::Value *> cast_of;
+    std::vector<llvm::AddrSpaceCastInst *> todo;
+    for (llvm::Instruction & I : llvm::instructions(F))
+        if (auto * C = llvm::dyn_cast<llvm::AddrSpaceCastInst>(&I))
+            if (auto * G = llvm::dyn_cast<llvm::GetElementPtrInst>(C->getPointerOperand()))
+                if (llvm::isa<llvm::Argument>(G->getPointerOperand()) &&
+                    G->getPointerOperandType()->isPointerTy() && !C->getType()->isVectorTy())
+                    todo.push_back(C);
+    llvm::IRBuilder<> EB(&*F.getEntryBlock().getFirstInsertionPt());
+    for (llvm::AddrSpaceCastInst * C : todo)
+    {
+        auto * G = llvm::cast<llvm::GetElementPtrInst>(C->getPointerOperand());
+        llvm::Value * base = G->getPointerOperand();
+        const unsigned as = C->getType()->getPointerAddressSpace();
+        llvm::Value *& cb = cast_of[{ base, as }];
+        if (cb == nullptr)
+            cb = EB.CreateAddrSpaceCast(base, C->getType(), base->getName() + ".as" + std::to_string(as));
+        llvm::IRBuilder<> B(C);
+        llvm::SmallVector<llvm::Value *, 4> idx(G->idx_begin(), G->idx_end());
+        llvm::Value * NG = B.CreateGEP(G->getSourceElementType(), cb, idx, G->getName(), G->getNoWrapFlags());
+        C->replaceAllUsesWith(NG);
+        C->eraseFromParent();
+        if (G->use_empty())
+            G->eraseFromParent();
+    }
+    return !todo.empty();
+}
+
+/* Give back its guard to a loop the optimizer merged into its predecessor's.
+ *
+ * Two bodies each start with `if (first < last) { loop }`. With nothing
+ * between them, jump threading folds the second test into the first loop's
+ * exit (it is already known there), leaving
+ *     G1: br c, N, P1      P1 -> L1 -> E1 -> L2 -> N
+ * which loop-fusion refuses ("only one candidate is guarded"). This restores
+ *     G1: br c, G2, P1     P1 -> L1 -> E1 -> G2;   G2: br c, N, P2 -> L2 -> N
+ * -- G2 re-tests G1's own condition, which is false when coming from L1 and
+ * true when coming from G1, so behaviour is unchanged -- the shape of two
+ * adjacent guarded loops loop-fusion fuses. Sibling loops at any depth (the
+ * distribute loops of two bodies, then their inner loops), N without phis. Returns whether something changed. */
+static bool
+reguard_adjacent_loops(llvm::Function & F)
+{
+    llvm::DominatorTree DT(F);
+    llvm::LoopInfo      LI(DT);
+    for (llvm::Loop * L1 : LI.getLoopsInPreorder())
+    {
+        /* not L1->getLoopGuardBranch(): that requires the guard to skip to
+         * L1's exit successor, which is precisely the shape lost here */
+        llvm::BasicBlock * P1 = L1->getLoopPreheader();
+        llvm::BasicBlock * E1 = L1->getExitBlock();
+        llvm::BasicBlock * GB = P1 ? P1->getSinglePredecessor() : nullptr;
+        auto * G1 = GB ? llvm::dyn_cast<llvm::CondBrInst>(GB->getTerminator()) : nullptr;
+        if (G1 == nullptr || E1 == nullptr || G1->getSuccessor(0) == G1->getSuccessor(1))
+            continue;
+        const unsigned in1 = (G1->getSuccessor(0) == P1) ? 0 : 1;
+        llvm::BasicBlock * N = G1->getSuccessor(1 - in1);
+        if (llvm::isa<llvm::PHINode>(N->front()))
+            continue;
+        /* E1 is L2's (dedicated) preheader */
+        llvm::BasicBlock * H2 = E1->getSingleSuccessor();
+        llvm::Loop * L2 = H2 ? LI.getLoopFor(H2) : nullptr;
+        if (L2 == nullptr || L2 == L1 || L2->getParentLoop() != L1->getParentLoop() || L2->getHeader() != H2 ||
+            L2->getLoopPreheader() != E1 || L2->getLoopGuardBranch() != nullptr ||
+            E1->getSinglePredecessor() == nullptr || L2->getExitBlock() == nullptr ||
+            (L2->getExitBlock() != N && L2->getExitBlock()->getSingleSuccessor() != N))
+            continue;
+        /* split E1: its instructions stay in E1 (L1's exit), the new guard G2
+         * follows, and a fresh preheader P2 leads into L2 */
+        llvm::BasicBlock * P2 = llvm::SplitBlock(E1, E1->getTerminator());
+        P2->setName(H2->getName() + ".ph");
+        llvm::BasicBlock * G2 = llvm::BasicBlock::Create(F.getContext(), H2->getName() + ".guard", &F, P2);
+        E1->getTerminator()->setSuccessor(0, G2);
+        llvm::CondBrInst::Create(G1->getCondition(), in1 == 0 ? P2 : N, in1 == 0 ? N : P2, G2);
+        G1->setSuccessor(1 - in1, G2);
+        return true;
+    }
+    return false;
+}
+
+/* Remove the block barriers of a thread-independent kernel -- the runtime's
+ * implicit end-of-parallel-region barriers, and those left between fused
+ * bodies -- then let the optimizer merge what they kept apart: adjacent loops
+ * over the same iterations become one (loop-fusion), and a value a body stored
+ * is forwarded to the next body's load of it (gvn). Returns whether any
+ * barrier was removed. */
+static bool
+strip_block_barriers_and_merge(llvm::Module & M, llvm::Function & F, llvm::TargetMachine * TM)
+{
+    std::vector<llvm::Instruction *> dead;
+    for (llvm::Instruction & I : llvm::instructions(F))
+        if (auto * II = llvm::dyn_cast<llvm::IntrinsicInst>(&I))
+            if (II->getIntrinsicID() == llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_all ||
+                II->getIntrinsicID() == llvm::Intrinsic::nvvm_barrier_cta_sync_aligned_count)
+                dead.push_back(II);
+    for (llvm::Instruction * I : dead)
+        I->eraseFromParent();
+    if (dead.empty())
+        return false;
+    auto run = [&] (const char * pipeline) {
+        run_module_passes(M, TM, [pipeline] (llvm::PassBuilder & PB, llvm::ModulePassManager & MPM) {
+            if (llvm::Error err = PB.parsePassPipeline(MPM, pipeline))
+                llvm::consumeError(std::move(err));
+        });
+    };
+    hoist_argument_casts(F);
+    run("function(sccp,simplifycfg,instcombine,early-cse,loop-simplify,lcssa,"
+        "loop(loop-rotate,indvars,loop-deletion),simplifycfg,early-cse,loop-simplify,lcssa)");
+    /* fuse pairwise: each round may expose the next pair */
+    for (int i = 0 ; i < 8 ; ++i)
+    {
+        run("function(early-cse,simplifycfg,loop-simplify,lcssa)");
+        if (!reguard_adjacent_loops(F))
+            break;
+        run("function(loop-simplify,lcssa,loop-fusion)");
+    }
+    /* the fused loop carries one copy of the counter per body: indvars makes
+     * them one, so gvn sees body 2's load of x[i] read body 1's store */
+    run("function(loop-simplify,lcssa,loop(indvars),gvn,instcombine,simplifycfg,loop-simplify,"
+        "loop-mssa(licm),dse,instcombine,simplifycfg)");
+    return true;
+}
+
+/* Specialize a kernel for the launch it is replayed with, before it is
+ * optimized: every integer parameter becomes its recorded value, and the block
+ * size is declared exact ("nvvm.reqntid", which also makes the PTX require
+ * it). A recorded command replays the same arguments and launch every time, so
+ * the code may assume them; its artifact is keyed by them. Used for fused
+ * kernels, whose bodies then get computable trip counts -- the precondition
+ * for merging their loops. Returns the bytes the code now depends on. */
+static std::string
+specialize_for_launch(llvm::Function & F, const command_prog_t * prog, const env_params_t & env_params)
+{
+    const device_instance_t d = device_instance(F, prog, &env_params);
+    for (auto & kv : d.env.consts)
+    {
+        auto * A = const_cast<llvm::Argument *>(llvm::dyn_cast<llvm::Argument>(kv.first));
+        if (A == nullptr || !A->getType()->isIntegerTy())
+            continue;
+        /* a floating-point scalar passed as integer bits (e.g. a solver's
+         * alpha) is data, not shape: leave it a parameter */
+        bool shape = true;
+        llvm::SmallVector<const llvm::Value *, 8> work{ A };
+        llvm::SmallPtrSet<const llvm::Value *, 8> seen;
+        while (shape && !work.empty())
+        {
+            const llvm::Value * V = work.pop_back_val();
+            if (!seen.insert(V).second)
+                continue;
+            for (const llvm::User * U : V->users())
+            {
+                if (llvm::isa<llvm::BitCastInst>(U) || llvm::isa<llvm::IntToPtrInst>(U) ||
+                    llvm::isa<llvm::StoreInst>(U) ||
+                    (llvm::isa<llvm::CallBase>(U) && !llvm::isa<llvm::IntrinsicInst>(U)))
+                    shape = false;
+                else if (llvm::isa<llvm::TruncInst>(U) || llvm::isa<llvm::ZExtInst>(U) ||
+                         llvm::isa<llvm::SExtInst>(U) || llvm::isa<llvm::InsertValueInst>(U))
+                    work.push_back(U);
+            }
+        }
+        if (shape)
+            A->replaceAllUsesWith(llvm::ConstantInt::get(A->getType(), (uint64_t) kv.second, true));
+    }
+    declare_exact_block_size(F, prog);
+    return d.values;
+}
+
+/* After optimization (the runtime's launch-size reads are only visible once it
+ * is linked and inlined): the block size is the recorded one (declared exact
+ * by specialize_for_launch), and so is the grid size -- unless the runtime may
+ * tune it (grid_flexible). */
+static void
+specialize_grid(llvm::Function & F, const command_prog_t * prog)
+{
+    const unsigned g[3] = { prog->grid.x, prog->grid.y, prog->grid.z };
+    const unsigned b[3] = { prog->block.x, prog->block.y, prog->block.z };   /* exact: reqntid */
+    std::vector<llvm::IntrinsicInst *> dead;
+    for (llvm::Instruction & I : llvm::instructions(F))
+        if (auto * II = llvm::dyn_cast<llvm::IntrinsicInst>(&I))
+        {
+            int d = -1;
+            const unsigned * v = g;
+            switch (II->getIntrinsicID())
+            {
+                case llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_x: d = 0; break;
+                case llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_y: d = 1; break;
+                case llvm::Intrinsic::nvvm_read_ptx_sreg_nctaid_z: d = 2; break;
+                case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_x:   d = 0; v = b; break;
+                case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_y:   d = 1; v = b; break;
+                case llvm::Intrinsic::nvvm_read_ptx_sreg_ntid_z:   d = 2; v = b; break;
+                default: break;
+            }
+            if (d >= 0 && v[d] && (v == b || !prog->grid_flexible))
+            {
+                II->replaceAllUsesWith(llvm::ConstantInt::get(II->getType(), v[d]));
+                dead.push_back(II);
+            }
+        }
+    for (llvm::IntrinsicInst * II : dead)
+        II->eraseFromParent();
+}
+
 static std::string
 bitset_bytes(const std::vector<bool> & set)
 {
@@ -3668,6 +4068,9 @@ struct device_optimized_t
     std::string                        entry;
     std::string                        features;
     env_params_t                       env_params;   /* see device_runtime_env_params */
+    /* a fused kernel, before optimization, markers tagged: rebuilt per barrier
+     * plan with the markers lowered BEFORE optimizing (see build_final) */
+    std::string                        preopt_bc;
 };
 
 static std::mutex                                       device_optimized_mtx;
@@ -3912,8 +4315,12 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
          * what its markers lower to, so it is part of the artifact key, and of
          * the launch: only a remaining grid barrier needs every block resident. */
         std::string plan;
+        /* 'T' when the kernel was proven thread-independent and its block
+         * barriers removed (see strip_block_barriers_and_merge) */
+        std::string indep;
+        std::string spec;    /* argument values a specialized kernel depends on */
         auto set_key = [&] (const std::vector<bool> & set) {
-            const std::string b = bitset_bytes(set) + "|" + plan;
+            const std::string b = bitset_bytes(set) + "|" + plan + "|" + indep + "|" + spec;
             return cache_key_extend(key, b.data(), b.size());
         };
         auto settle_residency = [&] () {
@@ -3951,6 +4358,11 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
                 o.env_params = device_runtime_env_params(*E);
                 nmarkers = tag_grid_barrier_markers(*E);
             }
+            if (nmarkers)
+            {
+                llvm::raw_string_ostream os(o.preopt_bc);
+                llvm::WriteBitcodeToFile(*M, os);
+            }
             std::string err;
             auto TM = make_device_tm(dtriple, darch, o.features, err);
             if (!TM) fail("target", err);
@@ -3978,9 +4390,14 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             std::string meta;
             if (cache_meta_get(vkey, meta))
             {
-                const size_t bar = meta.find('|');
-                const std::string bits = meta.substr(0, bar);
-                plan = (bar == std::string::npos) ? std::string() : meta.substr(bar + 1);
+                /* "bits|plan|indep" */
+                const size_t b1 = meta.find('|');
+                const size_t b2 = (b1 == std::string::npos) ? b1 : meta.find('|', b1 + 1);
+                const std::string bits = meta.substr(0, b1);
+                plan  = (b1 == std::string::npos) ? std::string() : meta.substr(b1 + 1, b2 - b1 - 1);
+                indep = (b2 == std::string::npos) ? std::string() : meta.substr(b2 + 1);
+                if (!plan.empty())
+                    spec = inst.values;   /* fused kernels are specialized */
                 std::vector<bool> set(bits.size());
                 for (size_t i = 0 ; i < bits.size() ; ++i) set[i] = (bits[i] == '1');
                 std::string ptx;
@@ -3991,6 +4408,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
                     return ;
                 }
                 plan.clear();
+                indep.clear();
+                spec.clear();
             }
 
             device_optimized_t * O = lookup_optimized();
@@ -4005,28 +4424,65 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
 
             /* A program the runtime may launch with fewer blocks must have its
              * noalias facts hold for each grid it may get. */
-            std::vector<bool> set = device_noalias_proven(*oentry, prog, nullptr,
-                                                          O->env_params, TM.get());
-            if (prog->grid_flexible)
+            std::vector<bool> set;
+            for (unsigned g : device_launch_grids(prog))
             {
-                const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm)
-                                   ? prog->max_coresident_blocks / prog->blocks_per_sm : 0;
-                unsigned cand[CGIR_GRID_CANDIDATES_MAX];
-                const unsigned nc = command_prog_grid_candidates(prog->grid.x, nsm, cand);
-                for (unsigned c = 1 ; c < nc ; ++c)
-                {
-                    command_prog_t alt = *prog;
-                    alt.grid.x = cand[c];
-                    const std::vector<bool> s2 = device_noalias_proven(*oentry, &alt, nullptr,
-                                                                       O->env_params, TM.get());
-                    for (size_t i = 0 ; i < set.size() && i < s2.size() ; ++i)
-                        set[i] = set[i] && s2[i];
-                }
+                command_prog_t alt = *prog;
+                alt.grid.x = g;
+                const std::vector<bool> s2 = device_noalias_proven(*oentry, &alt, nullptr,
+                                                                   O->env_params, TM.get());
+                if (set.empty()) set = s2;
+                for (size_t i = 0 ; i < set.size() && i < s2.size() ; ++i)
+                    set[i] = set[i] && s2[i];
             }
             plan = device_barrier_plan(*oentry, prog, O->env_params, TM.get());
-            cache_meta_put(vkey, bitset_bytes(set) + "|" + plan);
-            const uint64_t skey = set_key(set);
             settle_residency();
+
+            /* The code to emit. A fused kernel is rebuilt from before
+             * optimization with its markers already lowered, so that the
+             * optimizer sees the bodies as the plan allows them to be -- with
+             * no barrier where none is needed -- and can clean up the OpenMP
+             * runtime state between them exactly as it does in one kernel
+             * (the opaque marker hid it: 8 block barriers where the
+             * ahead-of-time kernels have 2 each). The plan was proven on the
+             * marker form; a boundary it lowers to nothing has no cross-thread
+             * communication, so every per-thread-valid optimization across it
+             * is valid. */
+            llvm::LLVMContext lctx;
+            std::unique_ptr<llvm::Module> M;
+            if (!plan.empty() && !O->preopt_bc.empty())
+            {
+                auto P = llvm::parseBitcodeFile(llvm::MemoryBufferRef(O->preopt_bc, "preopt"), lctx);
+                if (!P) fail("rebuild", llvm::toString(P.takeError()));
+                M = std::move(*P);
+                lower_grid_barrier_markers(*M->getFunction(O->entry), plan);
+                specialize_for_launch(*M->getFunction(O->entry), prog, O->env_params);
+                spec = inst.values;   /* as the warm path above keys it */
+                if (!optimize_device_module(*M, TM.get(), dblibs, dnblibs, dlibs, dnlibs, std::string(), err))
+                    fail("optimize", err);
+                specialize_grid(*M->getFunction(O->entry), prog);
+                if (!grid_barrier_markers(*M->getFunction(O->entry)).empty())
+                    fail("rebuild", "a barrier marker survived lowering");
+            }
+            else
+                M = llvm::CloneModule(*O->mod);
+            llvm::Function * mentry = M->getFunction(O->entry);
+            if (add_noalias_params(*mentry, set))
+                reoptimize_after_noalias(*M, TM.get());
+
+            /* No thread communicates with another: drop the block barriers and
+             * merge the loops they kept apart. */
+            if (plan.find('2') == std::string::npos &&
+                device_thread_independent(*mentry, prog, O->env_params, TM.get()))
+            {
+                indep = "T";
+                strip_block_barriers_and_merge(*M, *mentry, TM.get());
+                if (dump)
+                    fprintf(stderr, "jit(device): `%s` is thread-independent: block barriers "
+                                    "removed\n", entry_name.c_str());
+            }
+            cache_meta_put(vkey, bitset_bytes(set) + "|" + plan + "|" + indep);
+            const uint64_t skey = set_key(set);
 
             std::string ptx;
             if (const int hit = cache_device_get(skey, ptx))
@@ -4034,17 +4490,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
                 finish(ptx, hit == 1 ? 1 : 2);
                 return ;
             }
-
-            std::unique_ptr<llvm::Module> M = llvm::CloneModule(*O->mod);
-            llvm::Function * mentry = M->getFunction(O->entry);
-            bool reopt = add_noalias_params(*mentry, set);
-            if (!plan.empty())
-            {
-                lower_grid_barrier_markers(*mentry, plan);
-                reopt |= (plan.find('0') != std::string::npos);
-            }
-            if (reopt)
-                reoptimize_after_noalias(*M, TM.get());
+            if (dump)
+                dump_module(dump_dir, "final.ll", *M);
             ptx = codegen_device_ptx(*M, TM.get(), err);
             if (ptx.empty()) fail("PTX emission failed", err);
             cache_device_put(skey, ptx);
@@ -4104,11 +4551,29 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
         };
         if (fused_markers)
         {
+            /* plan on an optimized copy, then lower the markers of the real
+             * module BEFORE optimizing it (see the prove path) */
             const size_t nmarkers = tag_grid_barrier_markers(*entry);
-            optimize();
-            check_markers_survived(*entry, nmarkers);
-            plan = device_barrier_plan(*entry, prog, device_runtime_env_params(*entry), TM.get());
+            std::unique_ptr<llvm::Module> A = llvm::CloneModule(*mod);
+            llvm::Function * aentry = A->getFunction(entry_name);
+            const std::string features = device_features_of(*A);
+            TM = make_device_tm(dtriple, darch, features, err);
+            if (!TM) fail("target", err);
+            if (!optimize_device_module(*A, TM.get(), dblibs, dnblibs, dlibs, dnlibs, std::string(), err))
+                fail("optimize", err);
+            check_markers_survived(*aentry, nmarkers);
+            plan = device_barrier_plan(*aentry, prog, device_runtime_env_params(*aentry), TM.get());
             settle_residency();
+            lower_grid_barrier_markers(*entry, plan);
+            spec = specialize_for_launch(*entry, prog, device_runtime_env_params(*entry));
+            optimize();
+            specialize_grid(*entry, prog);
+            if (plan.find('2') == std::string::npos &&
+                device_thread_independent(*entry, prog, device_runtime_env_params(*entry), TM.get()))
+            {
+                indep = "T";
+                strip_block_barriers_and_merge(*mod, *entry, TM.get());
+            }
         }
         const uint64_t skey = (nam == noalias::MODE_NONE && plan.empty()) ? key : set_key(set);
         {
@@ -4122,12 +4587,6 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
 
         if (!fused_markers)
             optimize();
-        else if (!plan.empty())
-        {
-            lower_grid_barrier_markers(*entry, plan);
-            if (plan.find('0') != std::string::npos)
-                reoptimize_after_noalias(*mod, TM.get());
-        }
         std::string ptx = codegen_device_ptx(*mod, TM.get(), err);
         if (ptx.empty()) fail("PTX emission failed", err);
         cache_device_put(skey, ptx);

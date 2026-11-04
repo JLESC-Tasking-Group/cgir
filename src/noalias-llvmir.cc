@@ -284,8 +284,8 @@ struct evaluator_t
         interval_t best = interval_t::none();
         for (BasicBlock * E : exiting)
         {
-            auto * Br = dyn_cast<BranchInst>(E->getTerminator());
-            if (Br == nullptr || !Br->isConditional())
+            auto * Br = dyn_cast<CondBrInst>(E->getTerminator());
+            if (Br == nullptr)
                 continue ;
             auto * Cmp = dyn_cast<ICmpInst>(Br->getCondition());
             if (Cmp == nullptr)
@@ -1352,6 +1352,50 @@ CGIR_NAMESPACE::noalias::barrier_requirements(llvm::Function & F,
             open_from = after;
     }
     return out;
+}
+
+bool
+CGIR_NAMESPACE::noalias::thread_independent(llvm::Function & F, const std::vector<base_t> & bases,
+                                            const env_t & env)
+{
+    llvm::TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+    llvm::TargetLibraryInfo     TLI(TLII);
+    llvm::AssumptionCache       AC(F);
+    llvm::DominatorTree         DT(F);
+    llvm::LoopInfo              LI(DT);
+    llvm::ScalarEvolution       SE(F, TLI, AC, DT, LI);
+
+    const unsigned thread_dims[6] = { env.block[0], env.block[1], env.block[2],
+                                      env.grid[0],  env.grid[1],  env.grid[2] };
+    for (int i = 0 ; i < 6 ; ++i)
+        if (thread_dims[i] == 0)
+            return false;
+
+    std::vector<access_rec_t> recs;
+    analysis_t a(F, bases, env, SE, LI, DT);
+    a.recs = &recs;
+    a.run();
+
+    const unsigned id[6] = {
+        llvm::Intrinsic::nvvm_read_ptx_sreg_tid_x,   llvm::Intrinsic::nvvm_read_ptx_sreg_tid_y,
+        llvm::Intrinsic::nvvm_read_ptx_sreg_tid_z,   llvm::Intrinsic::nvvm_read_ptx_sreg_ctaid_x,
+        llvm::Intrinsic::nvvm_read_ptx_sreg_ctaid_y, llvm::Intrinsic::nvvm_read_ptx_sreg_ctaid_z };
+    const void * thread_vars[6];
+    for (int i = 0 ; i < 6 ; ++i)
+        thread_vars[i] = analysis_t::thread_var(id[i]);
+
+    for (size_t i = 0 ; i < recs.size() ; ++i)
+    {
+        const access_rec_t & x = recs[i];
+        /* written memory other threads could see, outside user buffers */
+        if (x.mod && (x.owner.kind == owner_kind_t::SHARED || x.owner.kind == owner_kind_t::SYSTEM ||
+                      x.owner.kind == owner_kind_t::UNKNOWN))
+            return false;
+        for (size_t j = i ; j < recs.size() ; ++j)
+            if (pair_requirement(x, recs[j], bases, env, thread_vars, thread_dims) != BARRIER_NONE)
+                return false;
+    }
+    return true;
 }
 
 bool

@@ -55,7 +55,8 @@ CGIR_NAMESPACE_BEGIN
     F(COMMAND_TYPE_FD_WRITE,        command_file_t,             "FD-WRITE")         \
     F(COMMAND_TYPE_PACK,            command_pack_t,             "PACK")             \
     F(COMMAND_TYPE_CTRL_LOOP,       command_ctrl_loop_t,        "CTRL-LOOP")        \
-    F(COMMAND_TYPE_CTRL_DEMUX,      command_ctrl_demux_t,       "CTRL-DEMUX")
+    F(COMMAND_TYPE_CTRL_DEMUX,      command_ctrl_demux_t,       "CTRL-DEMUX")       \
+    F(COMMAND_TYPE_EMPTY,           void,                       "EMPTY")
 
 enum command_type_t
 {

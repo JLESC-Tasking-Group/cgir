@@ -49,6 +49,7 @@
 # include <list>
 # include <queue>
 # include <stack>
+# include <vector>
 
 # include <assert.h>
 # include <stdio.h>
@@ -332,6 +333,12 @@ struct command_graph_t
      * replay the whole graph as a single "super" task instead of one task per
      * command. */
     bool is_serial = false;
+
+    /* Set by the `critical-path` pass when some command of the graph has no
+     * measured duration: the runtime should time the commands while it
+     * replays the graph, then run the pass again (and clear the flag if the
+     * durations never all arrive). */
+    bool durations_wanted = false;
 
     /** Methods to allocate command, nodes and graphs */
     command_constructor_t command_new;

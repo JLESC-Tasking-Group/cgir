@@ -59,6 +59,14 @@ create_sequence_pass(void)
     return nullptr;
 }
 
+/* The `critical-path` pass annotates commands (command_t::priority) and does
+ * not transform the graph; only the legacy POD pass_critical_path exists. */
+std::unique_ptr<mlir::Pass>
+create_critical_path_pass(void)
+{
+    return nullptr;
+}
+
 std::unique_ptr<mlir::Pass>
 create_pass(command_graph_pass_t pass)
 {

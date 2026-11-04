@@ -10,6 +10,7 @@ set(TEST_SOURCES
     pack.cc
     pack-random.cc
     sequence.cc
+    critical-path.cc
     h2d-distribute.cc
 )
 

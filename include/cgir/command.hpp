@@ -439,6 +439,19 @@ struct command_t
     /* the command type */
     command_type_t type;
 
+    /* Measured execution time of the command, in nanoseconds: its best timed
+     * execution, recorded by the runtime while replaying the graph. 0 when not
+     * measured (yet). Read by the `critical-path` pass. */
+    uint64_t duration = 0;
+
+    /* Launch priority, set by the `critical-path` pass: the command's bottom
+     * level weighted by duration -- the time, in nanoseconds, of the longest
+     * chain from the command (included) to the end of its graph. When several
+     * commands are ready at once, a runtime launching them one at a time
+     * starts the highest first: it has the most work left behind it. 0 when
+     * not computed, which leaves the runtime's own order. */
+    uint64_t priority = 0;
+
     /* type-specific info */
     union
     {

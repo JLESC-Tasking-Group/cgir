@@ -486,6 +486,9 @@ jit_cache_key(const command_prog_t * prog)
          * disabling it also restores the coarser (and more sharing) key. */
         if (device_declare_min_ctas_per_sm())
             h = jit_fnv1a_seed(h, &prog->blocks_per_sm, sizeof(prog->blocks_per_sm));
+        /* A fused kernel's block size is compiled in (`nvvm.reqntid`, see
+         * declare_exact_block_size): part of the code. */
+        h = jit_fnv1a_seed(h, &prog->block, sizeof(prog->block));
         const uint64_t s = jit_static_salt();
         h = jit_fnv1a_seed(h, &s, sizeof(s));
     }
