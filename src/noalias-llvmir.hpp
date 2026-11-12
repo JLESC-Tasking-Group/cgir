@@ -32,6 +32,24 @@
  *                                values never overlap, so pointer deduplication
  *                                is enough (the CGO'26 behaviour). An assumption
  *                                about the program, not a deduction.
+ *    CGIR_NOALIAS=trusted        trust the program entirely: pointers with different
+ *                                runtime values never overlap, anywhere -- for the
+ *                                noalias marks (as distinct-base) and for the grid
+ *                                barriers of fused kernels, whose conflicts are then
+ *                                only between accesses through the same pointer
+ *                                value. No footprint is ever compared: the analyses
+ *                                see each pointer as a synthetic address that only
+ *                                says which arguments share a value, so every
+ *                                decision depends on the equality pattern of the
+ *                                pointers, the scalars and the launch -- never on
+ *                                the addresses themselves. That is what makes
+ *                                prog-fuse cacheable across instances and runs.
+ *                                An assumption, like distinct-base, and a stronger
+ *                                one: wrong for a program that passes two views of
+ *                                one buffer (A and A+n) to the same kernel.
+ *                                The default when caching is explicitly asked for
+ *                                (CGIR_JIT_CACHE=1, or CGIR_JIT_CACHE_DIR set)
+ *                                and CGIR_NOALIAS is not set; a warning says so.
  *    CGIR_NOALIAS=none           never mark anything.
  *
  *    CGIR_NOALIAS_VERIFY=1       run the prover on every assumption made under
@@ -67,11 +85,22 @@
 CGIR_NAMESPACE_BEGIN
 namespace noalias {
 
-enum policy_t { MODE_NONE, MODE_PROVE, MODE_DISTINCT_BASE };
+enum policy_t { MODE_NONE, MODE_PROVE, MODE_DISTINCT_BASE, MODE_TRUSTED };
 
 /* CGIR_NOALIAS, read once. Folded into the JIT cache salt. */
 policy_t mode(void);
 const char * mode_name(policy_t m);
+
+/* Whether pointer arguments with distinct values are assumed not to alias
+ * (distinct-base, trusted) rather than proven or left alone. */
+bool assume_distinct(void);
+
+/* Whether the analyses see synthetic pointer values (trusted, unless verifying):
+ * the k-th distinct non-null pointer value of an instance becomes
+ * canonical_address(k), so that what they conclude depends on which pointers are
+ * equal and not on where they point. */
+bool canonical_pointers(void);
+uint64_t canonical_address(unsigned k);
 
 /* CGIR_NOALIAS_VERIFY, read once. */
 bool verify(void);
@@ -171,6 +200,9 @@ bool bounded_conflict(const footprint_t & a, uint64_t va, const footprint_t & b,
  * ------------------------------------------------------------------------- */
 
 # define CGIR_GRID_BARRIER_MARKER "__cgir_grid_barrier"
+/* Function attribute of a fused device kernel: the index of its parameter that
+ * holds the grid barriers' state (see command_prog_t::grid_barrier_state). */
+# define CGIR_GRID_BARRIER_STATE_ATTR "cgir-grid-barrier-state"
 
 enum barrier_t { BARRIER_NONE = 0, BARRIER_BLOCK = 1, BARRIER_GRID = 2 };
 

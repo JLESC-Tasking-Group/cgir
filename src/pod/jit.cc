@@ -79,9 +79,9 @@ node_has_llvmir_source(const command_graph_node_t * u)
  * kernel SPMD-only and deletes that path, leaving 1 barrier: the device then
  * co-schedules 16 blocks/SM, they compete for the same cache, and DRAM traffic
  * goes from 168MB to 625MB for a 6x slower kernel. Better code, three times
- * slower. See command_prog_t::blocks_per_sm and the driver-side enforcement
- * (xkrt's cu_prog_prepare). And even at equal occupancy the two pipelines win
- * on different kernels -- hence `auto`. */
+ * slower. See command_prog_t::blocks_per_sm. And even at equal occupancy the
+ * two pipelines win on different kernels -- hence `auto`, which measures both
+ * and keeps the faster. */
 
 /* true iff `prog` still holds an ahead-of-time implementation the pass would
  * replace: a device kernel handle, or a host OpenMP task routine. Programs

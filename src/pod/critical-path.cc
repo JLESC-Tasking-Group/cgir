@@ -59,19 +59,24 @@ CGIR_NAMESPACE_USE;
  * later delays the whole graph by as much; launching an off-path command later
  * costs nothing as long as it stays off the path.
  *
- * Packs. The pass runs before `sequence`/`pack`, and the priorities travel
- * with the commands into the packs. When the runtime runs it again on the
- * replayed (packed) graph, it recurses: a PACK command weighs its measured
+ * Order. The pass runs right after the reductions, before the program
+ * transformations (`prog-fuse`, `jit`) and the grouping (`sequence`, `pack`),
+ * on the commands as recorded and timed. Those passes keep the priorities: a
+ * fused program keeps its chain head's, the commands keep theirs inside the
+ * packs, and a pack gets its members' largest.
+ *
+ * Packs. Run on a graph that already has packs, the pass recurses: a PACK command weighs its measured
  * duration -- or, before it has one, the critical path of its sub-graph -- and
  * each command inside gets its inner bottom level plus the priority of what
  * follows the pack, so priorities compare across nesting levels. A runtime
  * representation of the pack (e.g. a CUDA graph) uses them per node.
  *
- * Durations are a property of a run, not of the program: they are measured by
- * the runtime while it replays the graph. So when some command has none yet,
- * the pass computes what it can (an unknown duration weighs 0) and sets
- * command_graph_t::durations_wanted, asking the runtime to time the commands
- * and to run the pass again once it has. The graph itself is not modified.
+ * Durations are a property of a run, not of the program: the runtime measures
+ * them (e.g. XKRT times each command while the graph is recorded) before the
+ * pass runs. When some command has none, the pass computes what it can (an
+ * unknown duration weighs 0) and sets command_graph_t::durations_wanted, which
+ * a runtime may answer by timing the commands and running the pass again. The
+ * graph itself is not modified.
  */
 
 /* per-node pass storage */

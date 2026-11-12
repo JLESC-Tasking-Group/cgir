@@ -467,7 +467,7 @@ tag_noalias_domains(llvm::Function & F,
         for (size_t j = i + 1 ; j < n ; ++j)
         {
             bool d;
-            if (mode == noalias::MODE_DISTINCT_BASE)
+            if (noalias::assume_distinct())
             {
                 d = (bases[i].addr != bases[j].addr);
                 if (d && noalias::verify())
@@ -626,9 +626,30 @@ grid_barrier_markers(llvm::Function & F)
  * needs no reset. */
 struct grid_barrier_state_t
 {
-    llvm::GlobalVariable * count;
-    llvm::GlobalVariable * generation;
+    llvm::Value * count;
+    llvm::Value * generation;
 };
+
+/* The state of `F`'s grid barriers: the parameter that prog-fuse added for it
+ * (CGIR_GRID_BARRIER_STATE_ATTR), pointing at 2 x i32 of the program's own (see
+ * command_prog_t::grid_barrier_state). `b` must be in `F`. Returns {} when `F`
+ * has no such parameter. */
+static grid_barrier_state_t
+get_grid_barrier_state_param(llvm::IRBuilder<> & b, llvm::Function & F)
+{
+    const llvm::Attribute a = F.getFnAttribute(CGIR_GRID_BARRIER_STATE_ATTR);
+    unsigned idx;
+    if (!a.isStringAttribute() || a.getValueAsString().getAsInteger(10, idx) || idx >= F.arg_size())
+        return { nullptr, nullptr };
+    llvm::Argument * A = F.getArg(idx);
+    if (!A->getType()->isPointerTy())
+        return { nullptr, nullptr };
+    /* NVPTX global memory, where the runtime allocates it */
+    constexpr unsigned GLOBAL_AS = 1;
+    llvm::Type * i32 = b.getInt32Ty();
+    llvm::Value * base = b.CreateAddrSpaceCast(A, llvm::PointerType::get(b.getContext(), GLOBAL_AS));
+    return { base, b.CreateConstInBoundsGEP1_32(i32, base, 1) };
+}
 
 static grid_barrier_state_t
 get_or_create_grid_barrier_state(llvm::Module & M)
@@ -664,7 +685,12 @@ emit_grid_barrier(llvm::IRBuilder<> & b, llvm::Module & M)
     llvm::LLVMContext & ctx = M.getContext();
     llvm::Type * i32 = llvm::Type::getInt32Ty(ctx);
     llvm::Function * F = b.GetInsertBlock()->getParent();
-    grid_barrier_state_t st = get_or_create_grid_barrier_state(M);
+    /* the program's own state, when the kernel takes it as a parameter; else
+     * the module's (shared by every launch of the module: only safe when no
+     * two of them run at once) */
+    grid_barrier_state_t st = get_grid_barrier_state_param(b, *F);
+    if (st.count == nullptr)
+        st = get_or_create_grid_barrier_state(M);
 
     auto k0 = [&] { return llvm::ConstantInt::get(i32, 0); };
     auto k1 = [&] { return llvm::ConstantInt::get(i32, 1); };
@@ -1176,6 +1202,698 @@ prog_describe(const command_prog_t * p)
 
 # endif /* CGIR_SUPPORT_LLVM */
 
+/* Whether a pointer value is keyed by its offset from the instance's lowest such
+ * pointer (see device_instance_values and the prog-fuse key) rather than by its
+ * value: user-space addresses, [4 KiB, 2^56) -- x86-64 up to 5-level paging, and
+ * aarch64, whose mmap region sits just below 2^48 (0xffff...: a 2^47 bound
+ * left every pinned host buffer on Grace keyed by its address, i.e. a miss in
+ * the next run). The others -- null, small integers, sentinels such as ~0 --
+ * are keyed as they are. A pair across that line is decided the same in two
+ * instances whose user-space pointers moved by one amount: no footprint spans
+ * the 2^63 bytes between them. */
+static inline bool
+pointer_keyed_relative(uint64_t v)
+{
+    return v >= 4096 && v < (1ULL << 56);
+}
+
+# if CGIR_SUPPORT_LLVM
+/* ---------------------------------------------------------------------- *
+ * What prog-fuse reads from the parsed inputs, short of the code itself.  *
+ *                                                                        *
+ *  The result-cache key and the program installed on a hit depend on the  *
+ *  inputs' IR only through a few facts: each input's shape (leaf, packed  *
+ *  leaf, wrapper, outline), its arity, and the LLVM type of each          *
+ *  parameter (for the value deduplication and the slot sizes). These are  *
+ *  a function of the inputs' code and of a few command_prog_t fields, so   *
+ *  they are stored once under a key of those (fuse_layout_key), and a      *
+ *  later instance of the same chain computes the result key and installs  *
+ *  a cached result without parsing a module: parsing the chain was most   *
+ *  of what a warm fusion cost. The parse path derives everything from the  *
+ *  same layout (fuse_dedup, fuse_slot_info), so both paths decide alike.  *
+ * ---------------------------------------------------------------------- */
+struct fuse_layout_t
+{
+    static constexpr uint16_t NONE = 0xFFFF;
+    enum : uint8_t { LEAF = 0, PACKED_LEAF = 1, WRAPPER = 2, OUTLINE = 3 };
+    /* a parameter type, by its store size and ABI alignment under the merged
+     * module's data layout; types[0] is `ptr` (address space 0) */
+    struct type_t  { uint8_t is_ptr; uint32_t size; uint32_t align; };
+    struct input_t
+    {
+        uint8_t               kind        = LEAF;
+        uint8_t               value_dedup = 0;
+        uint32_t              arity       = 0;
+        /* per parameter: the type that identifies a by-value deduplicated slot
+         * (NONE: the input is not value-deduplicated), and the parameter's type
+         * as the fused wrapper reads it (NONE: wrapper or packed leaf) */
+        std::vector<uint16_t> vt, st;
+    };
+    std::vector<type_t>  types;
+    std::vector<input_t> in;
+    uint8_t              packed_output = 0;
+};
+
+/* The deduplicated argument slots of one chain instance (step 3b). */
+struct fuse_slots_t
+{
+    std::vector<void *>                unique;   /* the fused args, first occurrence */
+    std::vector<size_t>                size;     /* byte size from the params table (0: none) */
+    std::vector<bool>                  is_ref;   /* REFERENCE (pointer) slot */
+    std::vector<uint16_t>              st;       /* layout type of the slot (NONE: untyped) */
+    std::vector<std::vector<unsigned>> index_map;
+    std::vector<unsigned>              wrapper_start;
+};
+
+/* A deduplicated slot as the key, the packed layout and the args buffer see it:
+ * typed = read through an IR parameter type (size/align/is_ptr are that type's). */
+struct fuse_slot_t
+{
+    bool   typed;
+    bool   is_ptr;
+    size_t size;
+    size_t align;
+    bool operator==(const fuse_slot_t & o) const
+    { return typed == o.typed && is_ptr == o.is_ptr && size == o.size && align == o.align; }
+};
+
+static uint64_t
+fuse_layout_key(command_prog_t ** progs, size_t n)
+{
+    std::string sig = "cgir.prog-fuse.layout.v1";
+    auto put = [&] (const void * p, size_t sz) { sig.append(static_cast<const char *>(p), sz); };
+    const char packed_env = dump_enabled("CGIR_PROG_FUSE_PACKED") ? 1 : 0;
+    put(&packed_env, 1);
+    put(&n, sizeof(n));
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        const command_prog_t * p = progs[i];
+        if (p->source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
+            return 0;
+        const auto & L = p->source.content.llvmir;
+        const uint64_t ck = cache_key(p);   /* code, proto, symbol, triple, arch */
+        put(&ck, sizeof(ck));
+        put(&p->launch_mode, sizeof(p->launch_mode));
+        put(&p->n_args, sizeof(p->n_args));
+        const char has_params = L.params ? 1 : 0;
+        put(&has_params, 1);
+        put(&L.param_count, sizeof(L.param_count));
+        for (size_t k = 0 ; L.params && k < L.param_count ; ++k)
+        {
+            put(&L.params[k].kind,   sizeof(L.params[k].kind));
+            put(&L.params[k].size,   sizeof(L.params[k].size));
+            put(&L.params[k].offset, sizeof(L.params[k].offset));
+        }
+    }
+    return cache_key_extend(0x9e3779b97f4a7c15ULL, sig.data(), sig.size());
+}
+
+static std::string
+fuse_layout_encode(const fuse_layout_t & L)
+{
+    std::string s = "L1";
+    auto put = [&] (const void * p, size_t sz) { s.append(static_cast<const char *>(p), sz); };
+    const uint32_t nt = (uint32_t) L.types.size(), ni = (uint32_t) L.in.size();
+    put(&nt, 4);
+    for (const auto & t : L.types) { put(&t.is_ptr, 1); put(&t.size, 4); put(&t.align, 4); }
+    put(&L.packed_output, 1);
+    put(&ni, 4);
+    for (const auto & in : L.in)
+    {
+        put(&in.kind, 1); put(&in.value_dedup, 1); put(&in.arity, 4);
+        put(in.vt.data(), in.arity * sizeof(uint16_t));
+        put(in.st.data(), in.arity * sizeof(uint16_t));
+    }
+    return s;
+}
+
+static bool
+fuse_layout_decode(const std::string & s, size_t n, fuse_layout_t & L)
+{
+    size_t at = 0;
+    auto get = [&] (void * p, size_t sz) -> bool {
+        if (at + sz > s.size()) return false;
+        memcpy(p, s.data() + at, sz); at += sz; return true;
+    };
+    char tag[2];
+    uint32_t nt = 0, ni = 0;
+    if (!get(tag, 2) || tag[0] != 'L' || tag[1] != '1' || !get(&nt, 4) || nt == 0 || nt >= fuse_layout_t::NONE)
+        return false;
+    L.types.resize(nt);
+    for (auto & t : L.types)
+        if (!get(&t.is_ptr, 1) || !get(&t.size, 4) || !get(&t.align, 4) || t.align == 0)
+            return false;
+    if (!get(&L.packed_output, 1) || !get(&ni, 4) || ni != n)
+        return false;
+    L.in.resize(ni);
+    for (auto & in : L.in)
+    {
+        if (!get(&in.kind, 1) || !get(&in.value_dedup, 1) || !get(&in.arity, 4) || in.kind > fuse_layout_t::OUTLINE
+            || in.arity > (s.size() - at) / (2 * sizeof(uint16_t)))
+            return false;
+        in.vt.resize(in.arity); in.st.resize(in.arity);
+        if (!get(in.vt.data(), in.arity * sizeof(uint16_t)) || !get(in.st.data(), in.arity * sizeof(uint16_t)))
+            return false;
+        for (unsigned j = 0 ; j < in.arity ; ++j)
+            if ((in.vt[j] != fuse_layout_t::NONE && in.vt[j] >= nt) || (in.st[j] != fuse_layout_t::NONE && in.st[j] >= nt))
+                return false;
+    }
+    return at == s.size();
+}
+
+/* Step 3b: deduplicate the argument slots of all leaf inputs. Two parameters with
+ * the same identity collapse to one compacted index, the first slot seen standing
+ * for them; a wrapper input keeps a contiguous, non-deduplicated block (it expects
+ * a void** slice). Identity, per slot:
+ *  - with the compiler's parameter table: a REFERENCE by its pointer value, a
+ *    COPY by its `size` bytes;
+ *  - else, for a value-deduplicated input (OpenMP leaf task bodies, device
+ *    kernels: per-task / per-launch copies of shared values), by type and value
+ *    for scalars up to 64 bytes;
+ *  - else by the slot's address.
+ * False when an input that takes arguments has none recorded. */
+static bool
+fuse_dedup(command_prog_t ** progs, size_t n, const fuse_layout_t & L, fuse_slots_t & S)
+{
+    S = fuse_slots_t();
+    S.index_map.resize(n);
+    S.wrapper_start.assign(n, 0);
+    std::unordered_map<std::string, unsigned> slot_to_index;
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        const fuse_layout_t::input_t & in = L.in[i];
+        void ** av = progs[i]->args;
+        if (av == nullptr && in.arity > 0)
+            return false;
+        const command_prog_param_t * params = progs[i]->source.content.llvmir.params;
+        const size_t                 pcount = progs[i]->source.content.llvmir.param_count;
+        if (in.kind == fuse_layout_t::WRAPPER)
+        {
+            S.wrapper_start[i] = (unsigned) S.unique.size();
+            for (unsigned k = 0 ; k < in.arity ; ++k)
+            {
+                S.unique.push_back(av[k]);
+                S.size.push_back(sizeof(void *));
+                S.is_ref.push_back(true);                 /* void** slice slots are pointers */
+                S.st.push_back(fuse_layout_t::NONE);
+            }
+            continue ;
+        }
+        S.index_map[i].resize(in.arity);
+        for (unsigned j = 0 ; j < in.arity ; ++j)
+        {
+            void * s = av[j];
+            const bool has_param = params != nullptr && j < pcount;
+            std::string key;
+            if (s != nullptr && has_param &&
+                (params[j].kind == CGIR_COMMAND_PROG_PARAM_COPY ? params[j].size : sizeof(void *)) > 0)
+            {
+                const size_t K = (params[j].kind == CGIR_COMMAND_PROG_PARAM_COPY) ? params[j].size : sizeof(void *);
+                key.push_back(params[j].kind == CGIR_COMMAND_PROG_PARAM_COPY ? 'C' : 'R');
+                key.append(reinterpret_cast<const char *>(&K), sizeof(K));
+                key.append(reinterpret_cast<const char *>(s), K);
+            }
+            else if (s != nullptr && in.vt[j] != fuse_layout_t::NONE &&
+                     L.types[in.vt[j]].size > 0 && L.types[in.vt[j]].size <= 64)
+            {
+                key.push_back('V');
+                key.append(reinterpret_cast<const char *>(&in.vt[j]), sizeof(in.vt[j]));
+                key.append(reinterpret_cast<const char *>(s), L.types[in.vt[j]].size);
+            }
+            else
+            {
+                key.push_back('A');
+                key.append(reinterpret_cast<const char *>(&s), sizeof(s));
+            }
+            auto it = slot_to_index.find(key);
+            unsigned idx;
+            if (it == slot_to_index.end())
+            {
+                idx = (unsigned) S.unique.size();
+                S.unique.push_back(s);
+                S.size.push_back(has_param ? (params[j].kind == CGIR_COMMAND_PROG_PARAM_COPY ? params[j].size
+                                                                                          : sizeof(void *)) : 0);
+                S.is_ref.push_back(has_param && params[j].kind == CGIR_COMMAND_PROG_PARAM_REFERENCE);
+                S.st.push_back(fuse_layout_t::NONE);
+                slot_to_index.emplace(std::move(key), idx);
+            }
+            else
+                idx = it->second;
+            S.index_map[i][j] = idx;
+            /* the slot's type, from its first use by a typed leaf (a slot shared by
+             * several kernels is read as one type by all: see step 6) */
+            if (in.kind == fuse_layout_t::LEAF && S.st[idx] == fuse_layout_t::NONE)
+                S.st[idx] = in.st[j];
+        }
+    }
+    return true;
+}
+
+/* The deduplicated slots as typed by the layout. */
+static std::vector<fuse_slot_t>
+fuse_slot_info(const fuse_layout_t & L, const fuse_slots_t & S)
+{
+    std::vector<fuse_slot_t> K(S.unique.size());
+    for (size_t k = 0 ; k < K.size() ; ++k)
+    {
+        if (S.st[k] == fuse_layout_t::NONE) { K[k] = { false, false, 0, 0 }; continue ; }
+        const fuse_layout_t::type_t & t = L.types[S.st[k]];
+        K[k] = { true, t.is_ptr != 0, t.size, t.align };
+    }
+    return K;
+}
+
+/* Step 6 (packed output): each deduplicated slot at its naturally aligned offset. */
+static size_t
+fuse_packed_offsets(const fuse_layout_t & L, const fuse_slots_t & S, const std::vector<fuse_slot_t> & K,
+                    bool any_packed_leaf, std::vector<size_t> & slot_offset)
+{
+    size_t packed_size = 0;
+    slot_offset.assign(S.unique.size(), 0);
+    for (size_t k = 0 ; k < S.unique.size() ; ++k)
+    {
+        size_t sz, al;
+        if (any_packed_leaf)
+        {
+            /* packed leaves: slot bytes come from the params table. Reference
+             * (pointer) slots are reconstructed with a typed load/store (to
+             * preserve pointer provenance so DependenceAnalysis can fuse the
+             * loops), so align them naturally; by-value copies go through memcpy
+             * and tolerate any alignment. */
+            sz = S.size[k] ? S.size[k] : 1;
+            al = S.is_ref[k] ? sizeof(void *) : 1;
+        }
+        else if (K[k].typed)
+        {
+            sz = K[k].size;
+            al = K[k].align;
+        }
+        else
+        {
+            sz = L.types[0].size;     /* an untyped slot holds a pointer */
+            al = L.types[0].align;
+        }
+        packed_size = (packed_size + al - 1) & ~(al - 1);
+        slot_offset[k] = packed_size;
+        packed_size += sz;
+    }
+    return packed_size ? packed_size : 1;
+}
+
+/* The prog-fuse result key (see 6a in command_graph_prog_fuse_llvmir); 0 when the
+ * chain is not keyable (a wrapper or outline input, a slot of unknown size). */
+static uint64_t
+fuse_result_key(command_prog_t ** progs, size_t n, const fuse_layout_t & L, const fuse_slots_t & S,
+                const std::vector<fuse_slot_t> & K, bool packed_output)
+{
+    for (size_t i = 0 ; i < n ; ++i)
+        if (L.in[i].kind == fuse_layout_t::WRAPPER || L.in[i].kind == fuse_layout_t::OUTLINE)
+            return 0;
+    std::string sig = "cgir.prog-fuse.v2";
+    auto put = [&] (const void * p, size_t sz) { sig.append(static_cast<const char *>(p), sz); };
+    auto put_str = [&] (const char * s) { if (s) put(s, strlen(s)); put("", 1); };
+    const char knobs[3] = { (char) noalias::mode(), (char) (noalias::canonical_pointers() ? 1 : 0),
+                            (char) (packed_output ? 1 : 0) };
+    put(knobs, sizeof(knobs));
+    put_str(getenv("CGIR_PROG_FUSE_GRID_BARRIER"));
+    put(&n, sizeof(n));
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        const command_prog_t * p = progs[i];
+        const uint64_t ck = cache_key(p);
+        put(&ck, sizeof(ck));
+        put(&p->launch_mode, sizeof(p->launch_mode));
+        put(&p->prototype, sizeof(p->prototype));
+        put(&p->grid, sizeof(p->grid));
+        put(&p->block, sizeof(p->block));
+        put(&p->blocks_per_sm, sizeof(p->blocks_per_sm));
+        put(&p->dyn_shmem, sizeof(p->dyn_shmem));
+        put(&p->max_coresident_blocks, sizeof(p->max_coresident_blocks));
+        const char flags[4] = { (char) p->grid_flexible, (char) (L.in[i].kind == fuse_layout_t::PACKED_LEAF),
+                                (char) L.in[i].value_dedup, (char) p->requires_coresident_grid };
+        put(flags, sizeof(flags));
+        const size_t ar = S.index_map[i].size();
+        put(&ar, sizeof(ar));
+        put(S.index_map[i].data(), ar * sizeof(unsigned));
+    }
+    const unsigned total_args = (unsigned) S.unique.size();
+    put(&total_args, sizeof(total_args));
+    /* the argument values, one unique slot at a time */
+    auto slot_is_ptr  = [&] (unsigned k) { return K[k].typed ? K[k].is_ptr : (bool) S.is_ref[k]; };
+    std::vector<uint64_t> seen;   /* trusted: pointer values by first occurrence */
+    /* otherwise pointers by their offset from the lowest one, plus its low
+     * 16 bits: what the legality analysis decides depends on how the
+     * accessed ranges compare, which moving every pointer by one amount
+     * keeps -- and between runs the allocations do move, all by one
+     * amount (see device_instance_values, keyed the same way) */
+    uint64_t ref = 0;
+    if (!noalias::canonical_pointers())
+    {
+        for (unsigned k = 0 ; k < total_args ; ++k)
+        {
+            if (S.unique[k] == nullptr || !slot_is_ptr(k))
+                continue ;
+            uint64_t v = 0;
+            memcpy(&v, S.unique[k], sizeof(void *));
+            if (pointer_keyed_relative(v) && (ref == 0 || v < ref))
+                ref = v;
+        }
+        const uint64_t low = ref & 0xFFFFu;
+        put("R", 1);
+        put(&low, sizeof(low));
+    }
+    for (unsigned k = 0 ; k < total_args ; ++k)
+    {
+        const void * at = S.unique[k];
+        if (at == nullptr) { put("-", 1); continue ; }
+        if (slot_is_ptr(k))
+        {
+            uint64_t v = 0;
+            memcpy(&v, at, sizeof(void *));
+            if (noalias::canonical_pointers() && v != 0)
+            {
+                size_t c = 0;
+                while (c < seen.size() && seen[c] != v) ++c;
+                if (c == seen.size()) seen.push_back(v);
+                v = noalias::canonical_address((unsigned) c);
+            }
+            else if (pointer_keyed_relative(v))
+                v -= ref;
+            put("P", 1);
+            put(&v, sizeof(v));
+            continue ;
+        }
+        const size_t sz = K[k].typed ? K[k].size : S.size[k];
+        if (sz == 0)
+            return 0;
+        put("S", 1);
+        put(&sz, sizeof(sz));
+        put(at, sz);
+    }
+    return cache_key_extend(0x9e3779b97f4a7c15ULL, sig.data(), sig.size());
+}
+# endif /* CGIR_SUPPORT_LLVM */
+
+# if CGIR_SUPPORT_LLVM
+/* Steps 9-12 of command_graph_prog_fuse_llvmir: install the fused `bitcode` in
+ * `dst` (source, args buffer, launch fields) and release the consumed inputs.
+ * Shared by the parse path and the parse-free cached path, which differ only in
+ * how they obtained `bitcode` and the deduplicated slots. */
+static bool
+fuse_install(command_prog_t ** progs, size_t n, command_prog_t * dst, const std::string & bitcode,
+             const fuse_slots_t & S, const std::vector<fuse_slot_t> & K,
+             const std::vector<size_t> & slot_offset, size_t packed_size,
+             bool packed_output, bool device, bool any_outline, bool any_packed_leaf)
+{
+    const std::vector<void *> & unique_slots     = S.unique;
+    const std::vector<size_t> & unique_slot_size = S.size;
+    const unsigned              total_args       = (unsigned) S.unique.size();
+    char * bc_buf = static_cast<char *>(malloc(bitcode.size()));
+    if (!bc_buf) { fprintf(stderr, "prog-fuse: malloc failed\n"); abort(); }
+    memcpy(bc_buf, bitcode.data(), bitcode.size());
+
+    /* Free the previous source buffer iff a prior fusion produced (owns) it.
+     * dst may alias progs[0], whose source was already fully parsed in step 1
+     * (parseIR materialises the module), so the old buffer is no longer
+     * referenced and is safe to release here. */
+    if (dst->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
+        dst->source.content.llvmir._owned &&
+        dst->source.content.llvmir.raw)
+    {
+        free(dst->source.content.llvmir.raw);
+    }
+
+    dst->source.type                  = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
+    dst->source.content.llvmir.raw    = bc_buf;
+    dst->source.content.llvmir.size   = bitcode.size();
+    dst->source.content.llvmir._owned = true;   /* heap (malloc) — the pass owns it */
+    /* The fused entry is `__fused_wrapper`. Host chains resolve it by name/shape,
+     * so clear the per-input symbol; device chains must name it so the driver can
+     * cuModuleGetFunction the PTX entry. (dst may alias progs[0] whose triple/arch
+     * are preserved here, driving the jit pass's PTX codegen.) */
+    dst->source.content.llvmir.symbol = (device || any_outline) ? "__fused_wrapper" : nullptr;
+    /* the fused entry is void(void**), void(void*,size_t) when packed, or
+     * void(void**,void**,void**) for a nanos6 outline chain; it carries no
+     * per-parameter table (a re-fusion detects its shape by signature). */
+    dst->source.content.llvmir.proto        = any_outline
+        ? CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE
+        : (packed_output
+            ? CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
+            : CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR);
+    dst->source.content.llvmir.params       = nullptr;
+    dst->source.content.llvmir.param_count  = 0;
+    dst->source.content.llvmir._params_owned = false;
+
+    /* ------------------------------------------------------------------ *
+     * 9b. Merge the inputs' externalized-global resolution tables.        *
+     *                                                                     *
+     *  Each input externalizes the mutable globals it references; linking  *
+     *  the closures (step 4) merges same-named external declarations into  *
+     *  one, so the fused module needs the union of the inputs' tables      *
+     *  (deduplicated by symbol name) to resolve them at JIT. Entries are    *
+     *  shallow-copied: each `name` points to a stable (compile-time)       *
+     *  string and `addr` to a stable process object, so the merged buffer  *
+     *  outlives freeing any input table. We collect first (dst may alias   *
+     *  progs[0], whose table we read) then free dst's previous owned one.  *
+     * ------------------------------------------------------------------ */
+    std::vector<command_prog_extern_t> merged_externs;
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        if (progs[i]->source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
+            continue ;
+        const command_prog_extern_t * ex = progs[i]->source.content.llvmir.externs;
+        const size_t cnt = progs[i]->source.content.llvmir.externs_count;
+        for (size_t k = 0 ; k < cnt ; ++k)
+        {
+            if (ex[k].name == nullptr)
+                continue ;
+            bool dup = false;
+            for (const command_prog_extern_t & m : merged_externs)
+                if (m.name == ex[k].name || strcmp(m.name, ex[k].name) == 0) { dup = true; break ; }
+            if (!dup)
+                merged_externs.push_back(ex[k]);
+        }
+    }
+
+    if (dst->source.content.llvmir._externs_owned && dst->source.content.llvmir.externs)
+        free((void *) dst->source.content.llvmir.externs);
+
+    if (merged_externs.empty())
+    {
+        dst->source.content.llvmir.externs        = nullptr;
+        dst->source.content.llvmir.externs_count  = 0;
+        dst->source.content.llvmir._externs_owned = false;
+    }
+    else
+    {
+        const size_t bytes = merged_externs.size() * sizeof(command_prog_extern_t);
+        command_prog_extern_t * ebuf = static_cast<command_prog_extern_t *>(malloc(bytes));
+        if (!ebuf) { fprintf(stderr, "prog-fuse: malloc failed\n"); abort(); }
+        memcpy(ebuf, merged_externs.data(), bytes);
+        dst->source.content.llvmir.externs        = ebuf;
+        dst->source.content.llvmir.externs_count  = merged_externs.size();
+        dst->source.content.llvmir._externs_owned = true;
+    }
+
+    /* The fused module is NOT compiled here: the `jit` pass
+     * (command_graph_jit_llvmir) compiles dst->source and installs the function
+     * pointer. mod_u/ctx are released at scope exit (the bitcode above is the
+     * canonical artifact). */
+
+    /* ------------------------------------------------------------------ *
+     * 10. Fill the compacted args buffer with the deduplicated slots and   *
+     *     install the variadic launcher (with a NULL fn, set by `jit`).    *
+     *     dst may alias progs[0]; we read all originals' slots in step 2,  *
+     *     so writing dst now is safe.                                      *
+     * ------------------------------------------------------------------ */
+    const size_t n_args = (size_t) total_args;
+    void ** args_buf = nullptr;
+    if (packed_output)
+    {
+        /* Packed byte buffer: each deduplicated slot's VALUE inlined at its
+         * offset (matching the fused kernel's fixed-offset loads). unique_slots[k]
+         * points at the value (a &value slot), so we copy its byte size -- from the
+         * params table (packed leaves) or the IR slot type (unpacked leaves). */
+        char * buf = static_cast<char *>(calloc(packed_size ? packed_size : 1, 1));
+        if (!buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
+        for (unsigned k = 0 ; k < total_args ; ++k)
+        {
+            if (unique_slots[k] == nullptr)
+                continue;
+            size_t sz;
+            if (any_packed_leaf)
+                sz = unique_slot_size[k];
+            else if (K[k].typed)
+                sz = K[k].size;
+            else
+                continue;
+            if (sz == 0)
+                continue;
+            memcpy(buf + slot_offset[k], unique_slots[k], sz);
+        }
+        args_buf = reinterpret_cast<void **>(buf);
+    }
+    else
+    {
+        /* a device kernel also takes its barrier state (step 6): one more slot,
+         * pointing at a cell of this buffer (zero: no state yet, see
+         * command_prog_t::grid_barrier_state) */
+        const size_t extra = device ? 2 : 0;
+        args_buf = static_cast<void **>(calloc(n_args + extra ? n_args + extra : 1, sizeof(void *)));
+        if (!args_buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
+        for (unsigned k = 0 ; k < total_args ; ++k)
+            args_buf[k] = unique_slots[k];
+        if (device)
+            args_buf[n_args] = &args_buf[n_args + 1];
+    }
+
+    /* Free the previous args buffer iff a prior fusion produced (owns) it. dst
+     * may alias progs[0], whose arg slot VALUES were copied into unique_slots
+     * (and into the packed buffer above) already, so the old buffer is no longer
+     * referenced and is safe to release here. */
+    if (dst->_args_owned && dst->args)
+        free(dst->args);
+
+    /* A fused chain has no single ahead-of-time KMP routine, so it MUST be
+     * JIT-compiled (the `jit` pass fills the launcher fn). It is either a uniform
+     * void(void**) VARIADIC program or, under CGIR_PROG_FUSE_PACKED, a
+     * void(void*, size_t) PACKED program over the packed byte buffer. */
+    dst->prototype             = any_outline
+        ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
+        : (packed_output
+            ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
+            : CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC);
+    dst->launcher.variadic.fn  = nullptr;  /* compiled by the `jit` pass */
+    dst->args                  = args_buf;
+    /* For a nanos6 outline chain, n_args is the fused-instance count (the runtime
+     * passes args/dev/translation arrays of this length); the compacted args
+     * buffer is unused by the nanos6 launcher. */
+    dst->n_args                = any_outline ? n : n_args + (device ? 1 : 0);
+    dst->args_size             = packed_output ? packed_size : 0;
+    dst->_args_owned           = true;  /* heap (calloc/malloc) — the pass owns it */
+    dst->grid_barrier_state    = device ? &args_buf[n_args + 1] : nullptr;
+
+    /* ------------------------------------------------------------------ *
+     * 11b. Propagate the launch parameters to the fused program.          *
+     *                                                                     *
+     *  Every fused program shares identical grid/block dimensions and     *
+     *  launch mode: the prog-fuse passes only chain programs for which    *
+     *  command_prog_launch_params_equal() holds. The fused kernel is a    *
+     *  single launch over that common geometry and launch mode, so it     *
+     *  inherits progs[0]'s. We set this explicitly (rather than relying   *
+     *  on dst aliasing progs[0]) so a distinct dst is correct too.        *
+     *  progs[0]'s grid/block/launch_mode are never freed/modified above,  *
+     *  so reading them here is safe even when dst == progs[0].            *
+     *                                                                     *
+     *  The occupancy target is NOT uniform across the inputs (it follows  *
+     *  from each kernel's per-block resource use), and the fused kernel   *
+     *  replaces all of them at once, so it takes the most restrictive     *
+     *  non-zero value -- zero meaning "unconstrained" and losing to any   *
+     *  real target. Dynamic shared memory is a requirement rather than a  *
+     *  limit, so the fused program needs the largest of its inputs'.      *
+     * ------------------------------------------------------------------ */
+    unsigned int fused_blocks_per_sm = 0;
+    unsigned int fused_dyn_shmem     = 0;
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        const unsigned int b = progs[i]->blocks_per_sm;
+        if (b && (fused_blocks_per_sm == 0 || b < fused_blocks_per_sm))
+            fused_blocks_per_sm = b;
+        if (progs[i]->dyn_shmem > fused_dyn_shmem)
+            fused_dyn_shmem = progs[i]->dyn_shmem;
+    }
+
+    if (dst != progs[0])
+    {
+        dst->grid        = progs[0]->grid;
+        dst->block       = progs[0]->block;
+        dst->launch_mode = progs[0]->launch_mode;
+    }
+    else
+    {
+        assert(memcmp(&dst->grid,  &progs[0]->grid,  sizeof(dst->grid))  == 0);
+        assert(memcmp(&dst->block, &progs[0]->block, sizeof(dst->block)) == 0);
+        assert(dst->launch_mode == progs[0]->launch_mode);
+    }
+    dst->blocks_per_sm = fused_blocks_per_sm;
+    dst->dyn_shmem     = fused_dyn_shmem;
+    /* Carry the residency budget forward, and tell the runtime that this kernel
+     * now contains a grid-wide barrier: it must be launched so that every block
+     * runs at once (a cooperative launch, in CUDA), or the barrier never
+     * completes. The precondition was checked above; this is how the launcher
+     * learns it has to honour it. */
+    dst->max_coresident_blocks    = progs[0]->max_coresident_blocks;
+    dst->requires_coresident_grid = device;
+    /* The runtime may still tune the grid of a fused program whose every
+     * constituent allowed it: the jit pass proves its barrier plan, noalias
+     * facts and thread independence for each grid it may get
+     * (device_launch_grids), and a remaining grid barrier disables tuning
+     * (requires_coresident_grid). */
+    {
+        bool flexible = true;
+        for (size_t i = 0 ; i < n ; ++i)
+            flexible = flexible && progs[i]->grid_flexible;
+        dst->grid_flexible = flexible;
+    }
+    /* A fused program has no ahead-of-time counterpart to fall back to. */
+    dst->aot_variant.fn        = nullptr;
+    dst->aot_variant.dyn_shmem = 0;
+    dst->aot_variant.kmp_fn    = nullptr;
+    dst->aot_variant.kmp_task  = nullptr;
+    dst->aot_variant.selected  = CGIR_COMMAND_PROG_VARIANT_UNDECIDED;
+
+    /* ------------------------------------------------------------------ *
+     * 12. Release the consumed inputs' owned heap buffers.                 *
+     *                                                                      *
+     *  Every prog other than dst has been merged into dst and the caller   *
+     *  will contract it out of the graph. If such an input owns heap        *
+     *  buffers from an EARLIER fusion (e.g. re-fusing a node this pass      *
+     *  produced), free them now to avoid leaking on re-fusion. All reads of *
+     *  the inputs completed in steps 1-4 (source parsed/linked, arg slot   *
+     *  values copied into unique_slots), so this is safe. We skip any prog  *
+     *  aliasing dst (its old buffers were already handled above) and clear  *
+     *  each freed slot so an accidentally repeated prog is not double-freed.*
+     * ------------------------------------------------------------------ */
+    for (size_t i = 0 ; i < n ; ++i)
+    {
+        if (progs[i] == dst)
+            continue ;
+
+        if (progs[i]->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
+            progs[i]->source.content.llvmir._owned &&
+            progs[i]->source.content.llvmir.raw)
+        {
+            free(progs[i]->source.content.llvmir.raw);
+            progs[i]->source.content.llvmir.raw   = nullptr;
+            progs[i]->source.content.llvmir.size  = 0;
+            progs[i]->source.content.llvmir._owned = false;
+        }
+
+        if (progs[i]->_args_owned && progs[i]->args)
+        {
+            free(progs[i]->args);
+            progs[i]->args        = nullptr;
+            progs[i]->n_args      = 0;
+            progs[i]->_args_owned = false;
+        }
+
+        /* release an owned externs table from a prior fusion (its entries were
+         * shallow-copied into dst's merged table in step 9b) */
+        if (progs[i]->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
+            progs[i]->source.content.llvmir._externs_owned &&
+            progs[i]->source.content.llvmir.externs)
+        {
+            free((void *) progs[i]->source.content.llvmir.externs);
+            progs[i]->source.content.llvmir.externs        = nullptr;
+            progs[i]->source.content.llvmir.externs_count  = 0;
+            progs[i]->source.content.llvmir._externs_owned = false;
+        }
+    }
+
+    return true;
+}
+# endif /* CGIR_SUPPORT_LLVM */
+
 bool
 CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     command_prog_t ** progs,
@@ -1293,11 +2011,55 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     std::string dump_dir = dump ? dump_make_dir("CGIR_PROG_FUSE_DUMP", "prog-fuse") : std::string();
 
     /* ------------------------------------------------------------------ *
+     * 0b. Parse-free result reuse.                                        *
+     *                                                                     *
+     *  A chain whose layout (fuse_layout_t) a previous fusion stored is    *
+     *  deduplicated and keyed without parsing a module; on a result-cache  *
+     *  hit its cached bitcode (or refusal) is installed as is. Anything     *
+     *  else -- no layout yet, a result-cache miss -- takes the parse path,  *
+     *  which stores the layout for next time. Not while dumping or          *
+     *  verifying, which want the parse path's work.                        *
+     * ------------------------------------------------------------------ */
+    const uint64_t layout_key = (!dump && !noalias::verify()) ? fuse_layout_key(progs, n) : 0;
+    bool layout_stored = false;
+    if (layout_key)
+    {
+        scoped_phase_t _p("fuse-cached");
+        fuse_layout_t L;
+        fuse_slots_t  S;
+        std::string   lb, cached;
+        layout_stored = cache_meta_get(layout_key, lb) && fuse_layout_decode(lb, n, L);
+        if (layout_stored && fuse_dedup(progs, n, L, S))
+        {
+            const std::vector<fuse_slot_t> K = fuse_slot_info(L, S);
+            const uint64_t key = fuse_result_key(progs, n, L, S, K, L.packed_output);
+            if (key && cache_meta_get(key, cached) && !cached.empty())
+            {
+                if (cached[0] != 'F')
+                    return false;          /* refused before, for the same reasons */
+                bool any_packed_leaf = false, any_outline = false;
+                for (const auto & in : L.in)
+                {
+                    any_packed_leaf |= (in.kind == fuse_layout_t::PACKED_LEAF);
+                    any_outline     |= (in.kind == fuse_layout_t::OUTLINE);
+                }
+                std::vector<size_t> slot_offset(S.unique.size(), 0);
+                const size_t packed_size = L.packed_output
+                    ? fuse_packed_offsets(L, S, K, any_packed_leaf, slot_offset) : 0;
+                return fuse_install(progs, n, dst, cached.substr(1), S, K, slot_offset, packed_size,
+                                    L.packed_output, device, any_outline, any_packed_leaf);
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ *
      * 1. Parse all N IR modules into the SAME LLVMContext                 *
      * ------------------------------------------------------------------ */
     auto ctx = std::make_unique<llvm::LLVMContext>();
 
     std::vector<std::unique_ptr<llvm::Module>> mods(n);
+    std::optional<scoped_phase_t> _parse;
+    _parse.emplace("fuse-parse");
     for (size_t i = 0 ; i < n ; ++i)
     {
         if (progs[i]->source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
@@ -1320,6 +2082,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             dump_module(dump_dir, name, *mods[i]);
         }
     }
+    _parse.reset();
 
     /* ------------------------------------------------------------------ *
      * 2/3. Per input: identify the entry function and arity, snapshot its *
@@ -1365,6 +2128,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
          * memcmp over `size` bytes (any size). NULL => fall back to `ptypes`/width. */
         const command_prog_param_t * params;
         size_t                       param_count;
+        llvm::FunctionType *         entry_ty;    /* the entry's type, before linking */
     };
     std::vector<fuse_input_t> inputs(n);
 
@@ -1529,6 +2293,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
         inputs[i].value_dedup    = value_dedup;
         inputs[i].params         = progs[i]->source.content.llvmir.params;
         inputs[i].param_count    = progs[i]->source.content.llvmir.param_count;
+        inputs[i].entry_ty       = entry->getFunctionType();
 
         /* for value-deduplicated leaf inputs, snapshot the parameter types so the
          * dedup key can read exactly the value bytes (and distinguish types) */
@@ -1589,111 +2354,58 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
                 return false;
             }
 
-    std::vector<void *>                    unique_slots;
-    std::vector<size_t>                    unique_slot_size; /* byte size per unique slot */
-    std::vector<bool>                      unique_slot_is_ref; /* slot holds a pointer (REFERENCE) */
-    std::unordered_map<std::string, unsigned> slot_to_index;
-    std::vector<std::vector<unsigned>>     index_map(n);
-    std::vector<unsigned>                  wrapper_block_start(n, 0);
-
-    /* byte size of leaf slot (i,j) from its param descriptor (0 if unknown) */
-    auto slot_size = [&] (size_t i, unsigned j) -> size_t
+    /* What the rest of the pass needs from the parsed inputs (fuse_layout_t),
+     * stored after the result key for the parse-free path (0b). Types are
+     * identified as the shared context uniques them. */
+    fuse_layout_t             L;
+    std::vector<llvm::Type *> L_types;        /* L.types[t] describes L_types[t] */
     {
-        if (inputs[i].params != nullptr && j < inputs[i].param_count)
+        const llvm::DataLayout & DL0 = mods[0]->getDataLayout();
+        auto tid = [&] (llvm::Type * T) -> uint16_t {
+            for (size_t t = 0 ; t < L_types.size() ; ++t)
+                if (L_types[t] == T)
+                    return (uint16_t) t;
+            assert(L_types.size() < fuse_layout_t::NONE);
+            L_types.push_back(T);
+            L.types.push_back({ (uint8_t) (T->isPointerTy() ? 1 : 0),
+                                (uint32_t) DL0.getTypeStoreSize(T).getFixedValue(),
+                                (uint32_t) DL0.getABITypeAlign(T).value() });
+            return (uint16_t) (L_types.size() - 1);
+        };
+        tid(llvm::PointerType::getUnqual(*ctx));   /* types[0]: an untyped slot */
+        L.in.resize(n);
+        for (size_t i = 0 ; i < n ; ++i)
         {
-            const command_prog_param_t & p = inputs[i].params[j];
-            return (p.kind == CGIR_COMMAND_PROG_PARAM_COPY) ? p.size : sizeof(void *);
-        }
-        return 0;
-    };
-
-    /* true iff leaf slot (i,j) is a by-reference (pointer) parameter */
-    auto slot_is_ref = [&] (size_t i, unsigned j) -> bool
-    {
-        return inputs[i].params != nullptr && j < inputs[i].param_count &&
-               inputs[i].params[j].kind == CGIR_COMMAND_PROG_PARAM_REFERENCE;
-    };
-
-    /* Identity key for a leaf slot. When the compiler forwarded per-parameter
-     * descriptors (kind+size), dedup is EXPLICIT: a REFERENCE (shared) slot by
-     * its pointer value, a COPY (firstprivate) slot by memcmp over `size` bytes
-     * (any size). Otherwise fall back to the value_dedup width heuristic ("V" +
-     * type + bytes, scalars <=64b) and finally to "A" + slot address. */
-    auto slot_key = [&] (size_t i, unsigned j) -> std::string
-    {
-        void * s = inputs[i].slots[j];
-        if (s != nullptr && inputs[i].params != nullptr && j < inputs[i].param_count)
-        {
-            const command_prog_param_t & p = inputs[i].params[j];
-            const size_t K = (p.kind == CGIR_COMMAND_PROG_PARAM_COPY)
-                ? p.size : sizeof(void *);
-            if (K > 0)
+            fuse_layout_t::input_t & in = L.in[i];
+            in.kind = inputs[i].is_outline     ? fuse_layout_t::OUTLINE
+                    : inputs[i].is_wrapper     ? fuse_layout_t::WRAPPER
+                    : inputs[i].is_packed_leaf ? fuse_layout_t::PACKED_LEAF
+                    :                            fuse_layout_t::LEAF;
+            in.value_dedup = inputs[i].value_dedup ? 1 : 0;
+            in.arity       = inputs[i].arity;
+            in.vt.assign(in.arity, fuse_layout_t::NONE);
+            in.st.assign(in.arity, fuse_layout_t::NONE);
+            for (unsigned j = 0 ; j < in.arity ; ++j)
             {
-                std::string key;
-                key.push_back(p.kind == CGIR_COMMAND_PROG_PARAM_COPY ? 'C' : 'R');
-                key.append(reinterpret_cast<const char *>(&K), sizeof(K));
-                key.append(reinterpret_cast<const char *>(s), K);
-                return key;
-            }
-        }
-        if (inputs[i].value_dedup && s != nullptr && j < inputs[i].ptypes.size())
-        {
-            llvm::Type * Ty = inputs[i].ptypes[j];
-            uint64_t width = (mods[i] && Ty)
-                ? mods[i]->getDataLayout().getTypeStoreSize(Ty).getFixedValue()
-                : 0;
-            if (width > 0 && width <= 64)
-            {
-                std::string key;
-                key.push_back('V');
-                void * typ = (void *) Ty; /* types are uniqued in the shared ctx */
-                key.append(reinterpret_cast<const char *>(&typ), sizeof(typ));
-                key.append(reinterpret_cast<const char *>(s), (size_t) width);
-                return key;
-            }
-        }
-        std::string key;
-        key.push_back('A');
-        key.append(reinterpret_cast<const char *>(&s), sizeof(s));
-        return key;
-    };
-
-    for (size_t i = 0 ; i < n ; ++i)
-    {
-        if (inputs[i].is_wrapper)
-        {
-            wrapper_block_start[i] = (unsigned) unique_slots.size();
-            for (unsigned k = 0 ; k < inputs[i].arity ; ++k)
-            {
-                unique_slots.push_back(inputs[i].slots[k]);
-                unique_slot_size.push_back(sizeof(void *));
-                unique_slot_is_ref.push_back(true); /* void** slice slots are pointers */
-            }
-        }
-        else
-        {
-            index_map[i].resize(inputs[i].arity);
-            for (unsigned j = 0 ; j < inputs[i].arity ; ++j)
-            {
-                std::string key = slot_key(i, j);
-                auto it = slot_to_index.find(key);
-                unsigned idx;
-                if (it == slot_to_index.end())
-                {
-                    idx = (unsigned) unique_slots.size();
-                    unique_slots.push_back(inputs[i].slots[j]);
-                    unique_slot_size.push_back(slot_size(i, j));
-                    unique_slot_is_ref.push_back(slot_is_ref(i, j));
-                    slot_to_index[key] = idx;
-                }
-                else
-                {
-                    idx = it->second;
-                }
-                index_map[i][j] = idx;
+                if (j < inputs[i].ptypes.size() && inputs[i].ptypes[j])
+                    in.vt[j] = tid(inputs[i].ptypes[j]);
+                if (in.kind == fuse_layout_t::LEAF)
+                    in.st[j] = tid(inputs[i].entry_ty->getParamType(j));
             }
         }
     }
+
+    fuse_slots_t S;
+    if (!fuse_dedup(progs, n, L, S))
+    {
+        fprintf(stderr, "prog-fuse: an input has no variadic args populated\n");
+        return false;
+    }
+    std::vector<void *> &                unique_slots        = S.unique;
+    std::vector<size_t> &                unique_slot_size    = S.size;   /* byte size per unique slot */
+    std::vector<bool> &                  unique_slot_is_ref  = S.is_ref; /* slot holds a pointer (REFERENCE) */
+    std::vector<std::vector<unsigned>> & index_map           = S.index_map;
+    std::vector<unsigned> &              wrapper_block_start = S.wrapper_start;
 
     const unsigned total_args = (unsigned) unique_slots.size();
 
@@ -1806,36 +2518,61 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     if (any_outline)
         packed_output = false;
 
-    std::vector<size_t> slot_offset(total_args, 0);
-    size_t packed_size = 0;
-    if (packed_output)
+    /* The deduplicated slots as typed here, after linking. The layout types
+     * them from the inputs before linking, which is what the parse-free path
+     * (0b) has: it is stored only if both agree (they do, short of the linker
+     * remapping a parameter's type). */
+    std::vector<fuse_slot_t> K(total_args);
+    for (unsigned k = 0 ; k < total_args ; ++k)
     {
-        for (unsigned k = 0 ; k < total_args ; ++k)
-        {
-            size_t sz, al;
-            if (any_packed_leaf)
-            {
-                /* packed leaves: slot bytes come from the params table. Reference
-                 * (pointer) slots are reconstructed with a typed load/store (to
-                 * preserve pointer provenance so DependenceAnalysis can fuse the
-                 * loops), so align them naturally; by-value copies go through memcpy
-                 * and tolerate any alignment. */
-                sz = unique_slot_size[k] ? unique_slot_size[k] : 1;
-                al = unique_slot_is_ref[k] ? sizeof(void *) : 1;
-            }
-            else
-            {
-                llvm::Type * T = slot_type[k] ? slot_type[k] : ptr_ty;
-                sz = (size_t) DL.getTypeStoreSize(T).getFixedValue();
-                al = (size_t) DL.getABITypeAlign(T).value();
-            }
-            packed_size = (packed_size + al - 1) & ~(al - 1);
-            slot_offset[k] = packed_size;
-            packed_size += sz;
-        }
-        if (packed_size == 0)
-            packed_size = 1;
+        llvm::Type * T = slot_type[k];
+        K[k] = T ? fuse_slot_t{ true, T->isPointerTy(), (size_t) DL.getTypeStoreSize(T).getFixedValue(),
+                                (size_t) DL.getABITypeAlign(T).value() }
+                 : fuse_slot_t{ false, false, 0, 0 };
     }
+    L.packed_output = packed_output ? 1 : 0;
+    const bool layout_exact = (K == fuse_slot_info(L, S)) &&
+        L.types[0].size  == (uint32_t) DL.getTypeStoreSize(ptr_ty).getFixedValue() &&
+        L.types[0].align == (uint32_t) DL.getABITypeAlign(ptr_ty).value();
+
+    std::vector<size_t> slot_offset(total_args, 0);
+    const size_t packed_size = packed_output
+        ? fuse_packed_offsets(L, S, K, any_packed_leaf, slot_offset) : 0;
+
+    /* ------------------------------------------------------------------ *
+     * 6a. The prog-fuse result cache.                                     *
+     *                                                                     *
+     *  Everything below -- building the wrapper, the optimizer, and for a  *
+     *  device chain that must lose its grid barrier the legality analysis  *
+     *  (a whole second device pipeline) -- is a function of what the key   *
+     *  covers: the inputs' code (their JIT content keys, which carry the   *
+     *  toolchain salt and CGIR_NOALIAS), their launch and occupancy        *
+     *  fields, how the deduplication mapped their parameters, the prog-fuse *
+     *  knobs, and the argument values. Under CGIR_NOALIAS=trusted the       *
+     *  pointer values enter only as their equality pattern, because no      *
+     *  decision depends on more (see noalias::canonical_pointers); under    *
+     *  the other modes the exact bytes do, which is still sound and reuses  *
+     *  the result for the instances that repeat them. The fused bitcode is  *
+     *  cached, and so is a refusal (most chains are refused, and refusing   *
+     *  is what the legality analysis costs). The args buffer and launch     *
+     *  fields are not: they are rebuilt below from this instance.          *
+     *                                                                     *
+     *  In-process, plus on disk under CGIR_JIT_CACHE_DIR (the JIT's        *
+     *  derived-facts store). Not used while dumping, verifying, or for     *
+     *  inputs whose slot values cannot all be typed (a nested wrapper's    *
+     *  void** slice, a nanos6 outline).                                    *
+     * ------------------------------------------------------------------ */
+    uint64_t fuse_key = 0;
+    if (!dump && !noalias::verify())
+        fuse_key = fuse_result_key(progs, n, L, S, K, packed_output);
+    /* what the parse-free path (0b) needs to compute this key next time */
+    if (fuse_key && layout_key && layout_exact && !layout_stored)
+        cache_meta_put(layout_key, fuse_layout_encode(L));
+
+    std::string bitcode;
+    std::string fuse_cached;
+    const bool  fuse_hit = fuse_key && cache_meta_get(fuse_key, fuse_cached) && !fuse_cached.empty();
+    auto build_fused = [&] () -> bool {
 
     if (device)
     {
@@ -1843,13 +2580,20 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
          * the deduplicated kernel parameters, call each region kernel with its
          * subset, inline them, then collapse the per-kernel target_init/deinit
          * brackets into one. The jit pass codegens this to PTX. */
-        std::vector<llvm::Type *> ptypes(total_args);
+        /* ...plus a last parameter: the grid barriers' state (see
+         * command_prog_t::grid_barrier_state), so that each program has its own
+         * rather than one per module -- a module is shared by every launch of
+         * the same code, which may run concurrently. */
+        std::vector<llvm::Type *> ptypes(total_args + 1);
         for (unsigned k = 0 ; k < total_args ; ++k)
             ptypes[k] = slot_type[k] ? slot_type[k] : ptr_ty;
+        ptypes[total_args] = ptr_ty;
         llvm::FunctionType * wfty = llvm::FunctionType::get(void_ty, ptypes, false);
         llvm::Function * wrapper = llvm::Function::Create(
             wfty, llvm::GlobalValue::ExternalLinkage, "__fused_wrapper", mod_u.get());
         wrapper->setCallingConv(llvm::CallingConv::PTX_Kernel);
+        wrapper->addFnAttr(CGIR_GRID_BARRIER_STATE_ATTR, llvm::utostr(total_args));
+        wrapper->getArg(total_args)->setName("cgir.grid_barrier_state");
 
         /* carry the device kernel function attributes (kernel, nvvm.maxntid,
          * target-cpu/features) from a constituent; drop alwaysinline (this is the
@@ -1866,7 +2610,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
          * pointer, and marking both would be wrong even under the assumption.
          * Under `prove` nothing is marked here: the jit pass analyses the fused
          * kernel in its final form and marks what it can prove. */
-        if (noalias::mode() == noalias::MODE_DISTINCT_BASE)
+        if (noalias::assume_distinct())
             for (unsigned k = 0 ; k < total_args ; ++k)
             {
                 if (!ptypes[k]->isPointerTy() || unique_slots[k] == nullptr)
@@ -2352,8 +3096,12 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     if (device && grid_barrier_must_vanish)
     {
         std::string why;
-        if (!fused_device_kernel_avoids_grid_barrier(*mod_u, progs[0], unique_slots.data(),
-                                                     unique_slots.size(), why))
+        /* the kernel's last parameter, the barrier state, has no value yet */
+        static void * const no_barrier_state = nullptr;
+        std::vector<void *> slots = unique_slots;
+        slots.push_back(const_cast<void **>(&no_barrier_state));
+        if (!fused_device_kernel_avoids_grid_barrier(*mod_u, progs[0], slots.data(),
+                                                     slots.size(), why))
         {
             fprintf(stderr, "prog-fuse: device chain of %zu kernels left unfused: %s, and %s [%s]\n",
                     n, coresident_why.c_str(), why.c_str(), prog_describe(progs[0]).c_str());
@@ -2372,287 +3120,29 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
     /* ------------------------------------------------------------------ *
      * 9. Serialise the optimized module to bitcode for dst->source.       *
      * ------------------------------------------------------------------ */
-    std::string bitcode;
     {
         llvm::raw_string_ostream os(bitcode);
         llvm::WriteBitcodeToFile(*mod_u, os);
     }
-    char * bc_buf = static_cast<char *>(malloc(bitcode.size()));
-    if (!bc_buf) { fprintf(stderr, "prog-fuse: malloc failed\n"); abort(); }
-    memcpy(bc_buf, bitcode.data(), bitcode.size());
-
-    /* Free the previous source buffer iff a prior fusion produced (owns) it.
-     * dst may alias progs[0], whose source was already fully parsed in step 1
-     * (parseIR materialises the module), so the old buffer is no longer
-     * referenced and is safe to release here. */
-    if (dst->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
-        dst->source.content.llvmir._owned &&
-        dst->source.content.llvmir.raw)
-    {
-        free(dst->source.content.llvmir.raw);
-    }
-
-    dst->source.type                  = COMMAND_PROG_SOURCE_TYPE_LLVMIR;
-    dst->source.content.llvmir.raw    = bc_buf;
-    dst->source.content.llvmir.size   = bitcode.size();
-    dst->source.content.llvmir._owned = true;   /* heap (malloc) — the pass owns it */
-    /* The fused entry is `__fused_wrapper`. Host chains resolve it by name/shape,
-     * so clear the per-input symbol; device chains must name it so the driver can
-     * cuModuleGetFunction the PTX entry. (dst may alias progs[0] whose triple/arch
-     * are preserved here, driving the jit pass's PTX codegen.) */
-    dst->source.content.llvmir.symbol = (device || any_outline) ? "__fused_wrapper" : nullptr;
-    /* the fused entry is void(void**), void(void*,size_t) when packed, or
-     * void(void**,void**,void**) for a nanos6 outline chain; it carries no
-     * per-parameter table (a re-fusion detects its shape by signature). */
-    dst->source.content.llvmir.proto        = any_outline
-        ? CGIR_COMMAND_PROG_SOURCE_PROTO_NANOS6_OUTLINE
-        : (packed_output
-            ? CGIR_COMMAND_PROG_SOURCE_PROTO_PACKED_BUFFER
-            : CGIR_COMMAND_PROG_SOURCE_PROTO_VOID_PTRPTR);
-    dst->source.content.llvmir.params       = nullptr;
-    dst->source.content.llvmir.param_count  = 0;
-    dst->source.content.llvmir._params_owned = false;
-
-    /* ------------------------------------------------------------------ *
-     * 9b. Merge the inputs' externalized-global resolution tables.        *
-     *                                                                     *
-     *  Each input externalizes the mutable globals it references; linking  *
-     *  the closures (step 4) merges same-named external declarations into  *
-     *  one, so the fused module needs the union of the inputs' tables      *
-     *  (deduplicated by symbol name) to resolve them at JIT. Entries are    *
-     *  shallow-copied: each `name` points to a stable (compile-time)       *
-     *  string and `addr` to a stable process object, so the merged buffer  *
-     *  outlives freeing any input table. We collect first (dst may alias   *
-     *  progs[0], whose table we read) then free dst's previous owned one.  *
-     * ------------------------------------------------------------------ */
-    std::vector<command_prog_extern_t> merged_externs;
-    for (size_t i = 0 ; i < n ; ++i)
-    {
-        if (progs[i]->source.type != COMMAND_PROG_SOURCE_TYPE_LLVMIR)
-            continue ;
-        const command_prog_extern_t * ex = progs[i]->source.content.llvmir.externs;
-        const size_t cnt = progs[i]->source.content.llvmir.externs_count;
-        for (size_t k = 0 ; k < cnt ; ++k)
-        {
-            if (ex[k].name == nullptr)
-                continue ;
-            bool dup = false;
-            for (const command_prog_extern_t & m : merged_externs)
-                if (m.name == ex[k].name || strcmp(m.name, ex[k].name) == 0) { dup = true; break ; }
-            if (!dup)
-                merged_externs.push_back(ex[k]);
-        }
-    }
-
-    if (dst->source.content.llvmir._externs_owned && dst->source.content.llvmir.externs)
-        free((void *) dst->source.content.llvmir.externs);
-
-    if (merged_externs.empty())
-    {
-        dst->source.content.llvmir.externs        = nullptr;
-        dst->source.content.llvmir.externs_count  = 0;
-        dst->source.content.llvmir._externs_owned = false;
-    }
-    else
-    {
-        const size_t bytes = merged_externs.size() * sizeof(command_prog_extern_t);
-        command_prog_extern_t * ebuf = static_cast<command_prog_extern_t *>(malloc(bytes));
-        if (!ebuf) { fprintf(stderr, "prog-fuse: malloc failed\n"); abort(); }
-        memcpy(ebuf, merged_externs.data(), bytes);
-        dst->source.content.llvmir.externs        = ebuf;
-        dst->source.content.llvmir.externs_count  = merged_externs.size();
-        dst->source.content.llvmir._externs_owned = true;
-    }
-
-    /* The fused module is NOT compiled here: the `jit` pass
-     * (command_graph_jit_llvmir) compiles dst->source and installs the function
-     * pointer. mod_u/ctx are released at scope exit (the bitcode above is the
-     * canonical artifact). */
-
-    /* ------------------------------------------------------------------ *
-     * 10. Fill the compacted args buffer with the deduplicated slots and   *
-     *     install the variadic launcher (with a NULL fn, set by `jit`).    *
-     *     dst may alias progs[0]; we read all originals' slots in step 2,  *
-     *     so writing dst now is safe.                                      *
-     * ------------------------------------------------------------------ */
-    const size_t n_args = (size_t) total_args;
-    void ** args_buf = nullptr;
-    if (packed_output)
-    {
-        /* Packed byte buffer: each deduplicated slot's VALUE inlined at its
-         * offset (matching the fused kernel's fixed-offset loads). unique_slots[k]
-         * points at the value (a &value slot), so we copy its byte size -- from the
-         * params table (packed leaves) or the IR slot type (unpacked leaves). */
-        char * buf = static_cast<char *>(calloc(packed_size ? packed_size : 1, 1));
-        if (!buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
-        for (unsigned k = 0 ; k < total_args ; ++k)
-        {
-            if (unique_slots[k] == nullptr)
-                continue;
-            size_t sz;
-            if (any_packed_leaf)
-                sz = unique_slot_size[k];
-            else if (slot_type[k] != nullptr)
-                sz = (size_t) DL.getTypeStoreSize(slot_type[k]).getFixedValue();
-            else
-                continue;
-            if (sz == 0)
-                continue;
-            memcpy(buf + slot_offset[k], unique_slots[k], sz);
-        }
-        args_buf = reinterpret_cast<void **>(buf);
-    }
-    else
-    {
-        args_buf = static_cast<void **>(calloc(n_args ? n_args : 1, sizeof(void *)));
-        if (!args_buf) { fprintf(stderr, "prog-fuse: calloc failed\n"); abort(); }
-        for (unsigned k = 0 ; k < total_args ; ++k)
-            args_buf[k] = unique_slots[k];
-    }
-
-    /* Free the previous args buffer iff a prior fusion produced (owns) it. dst
-     * may alias progs[0], whose arg slot VALUES were copied into unique_slots
-     * (and into the packed buffer above) already, so the old buffer is no longer
-     * referenced and is safe to release here. */
-    if (dst->_args_owned && dst->args)
-        free(dst->args);
-
-    /* A fused chain has no single ahead-of-time KMP routine, so it MUST be
-     * JIT-compiled (the `jit` pass fills the launcher fn). It is either a uniform
-     * void(void**) VARIADIC program or, under CGIR_PROG_FUSE_PACKED, a
-     * void(void*, size_t) PACKED program over the packed byte buffer. */
-    dst->prototype             = any_outline
-        ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_NANOS6
-        : (packed_output
-            ? CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_PACKED
-            : CGIR_COMMAND_PROG_FUNCTION_PROTOTYPE_VARIADIC);
-    dst->launcher.variadic.fn  = nullptr;  /* compiled by the `jit` pass */
-    dst->args                  = args_buf;
-    /* For a nanos6 outline chain, n_args is the fused-instance count (the runtime
-     * passes args/dev/translation arrays of this length); the compacted args
-     * buffer is unused by the nanos6 launcher. */
-    dst->n_args                = any_outline ? n : n_args;
-    dst->args_size             = packed_output ? packed_size : 0;
-    dst->_args_owned           = true;  /* heap (calloc/malloc) — the pass owns it */
-
-    /* ------------------------------------------------------------------ *
-     * 11b. Propagate the launch parameters to the fused program.          *
-     *                                                                     *
-     *  Every fused program shares identical grid/block dimensions and     *
-     *  launch mode: the prog-fuse passes only chain programs for which    *
-     *  command_prog_launch_params_equal() holds. The fused kernel is a    *
-     *  single launch over that common geometry and launch mode, so it     *
-     *  inherits progs[0]'s. We set this explicitly (rather than relying   *
-     *  on dst aliasing progs[0]) so a distinct dst is correct too.        *
-     *  progs[0]'s grid/block/launch_mode are never freed/modified above,  *
-     *  so reading them here is safe even when dst == progs[0].            *
-     *                                                                     *
-     *  The occupancy target is NOT uniform across the inputs (it follows  *
-     *  from each kernel's per-block resource use), and the fused kernel   *
-     *  replaces all of them at once, so it takes the most restrictive     *
-     *  non-zero value -- zero meaning "unconstrained" and losing to any   *
-     *  real target. Dynamic shared memory is a requirement rather than a  *
-     *  limit, so the fused program needs the largest of its inputs'.      *
-     * ------------------------------------------------------------------ */
-    unsigned int fused_blocks_per_sm = 0;
-    unsigned int fused_dyn_shmem     = 0;
-    for (size_t i = 0 ; i < n ; ++i)
-    {
-        const unsigned int b = progs[i]->blocks_per_sm;
-        if (b && (fused_blocks_per_sm == 0 || b < fused_blocks_per_sm))
-            fused_blocks_per_sm = b;
-        if (progs[i]->dyn_shmem > fused_dyn_shmem)
-            fused_dyn_shmem = progs[i]->dyn_shmem;
-    }
-
-    if (dst != progs[0])
-    {
-        dst->grid        = progs[0]->grid;
-        dst->block       = progs[0]->block;
-        dst->launch_mode = progs[0]->launch_mode;
-    }
-    else
-    {
-        assert(memcmp(&dst->grid,  &progs[0]->grid,  sizeof(dst->grid))  == 0);
-        assert(memcmp(&dst->block, &progs[0]->block, sizeof(dst->block)) == 0);
-        assert(dst->launch_mode == progs[0]->launch_mode);
-    }
-    dst->blocks_per_sm = fused_blocks_per_sm;
-    dst->dyn_shmem     = fused_dyn_shmem;
-    /* Carry the residency budget forward, and tell the runtime that this kernel
-     * now contains a grid-wide barrier: it must be launched so that every block
-     * runs at once (a cooperative launch, in CUDA), or the barrier never
-     * completes. The precondition was checked above; this is how the launcher
-     * learns it has to honour it. */
-    dst->max_coresident_blocks    = progs[0]->max_coresident_blocks;
-    dst->requires_coresident_grid = device;
-    /* The runtime may still tune the grid of a fused program whose every
-     * constituent allowed it: the jit pass proves its barrier plan, noalias
-     * facts and thread independence for each grid it may get
-     * (device_launch_grids), and a remaining grid barrier disables tuning
-     * (requires_coresident_grid). */
-    {
-        bool flexible = true;
-        for (size_t i = 0 ; i < n ; ++i)
-            flexible = flexible && progs[i]->grid_flexible;
-        dst->grid_flexible = flexible;
-    }
-    /* A fused program has no ahead-of-time counterpart to fall back to. */
-    dst->aot_variant.fn        = nullptr;
-    dst->aot_variant.dyn_shmem = 0;
-    dst->aot_variant.kmp_fn    = nullptr;
-    dst->aot_variant.kmp_task  = nullptr;
-    dst->aot_variant.selected  = CGIR_COMMAND_PROG_VARIANT_UNDECIDED;
-
-    /* ------------------------------------------------------------------ *
-     * 12. Release the consumed inputs' owned heap buffers.                 *
-     *                                                                      *
-     *  Every prog other than dst has been merged into dst and the caller   *
-     *  will contract it out of the graph. If such an input owns heap        *
-     *  buffers from an EARLIER fusion (e.g. re-fusing a node this pass      *
-     *  produced), free them now to avoid leaking on re-fusion. All reads of *
-     *  the inputs completed in steps 1-4 (source parsed/linked, arg slot   *
-     *  values copied into unique_slots), so this is safe. We skip any prog  *
-     *  aliasing dst (its old buffers were already handled above) and clear  *
-     *  each freed slot so an accidentally repeated prog is not double-freed.*
-     * ------------------------------------------------------------------ */
-    for (size_t i = 0 ; i < n ; ++i)
-    {
-        if (progs[i] == dst)
-            continue ;
-
-        if (progs[i]->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
-            progs[i]->source.content.llvmir._owned &&
-            progs[i]->source.content.llvmir.raw)
-        {
-            free(progs[i]->source.content.llvmir.raw);
-            progs[i]->source.content.llvmir.raw   = nullptr;
-            progs[i]->source.content.llvmir.size  = 0;
-            progs[i]->source.content.llvmir._owned = false;
-        }
-
-        if (progs[i]->_args_owned && progs[i]->args)
-        {
-            free(progs[i]->args);
-            progs[i]->args        = nullptr;
-            progs[i]->n_args      = 0;
-            progs[i]->_args_owned = false;
-        }
-
-        /* release an owned externs table from a prior fusion (its entries were
-         * shallow-copied into dst's merged table in step 9b) */
-        if (progs[i]->source.type == COMMAND_PROG_SOURCE_TYPE_LLVMIR &&
-            progs[i]->source.content.llvmir._externs_owned &&
-            progs[i]->source.content.llvmir.externs)
-        {
-            free((void *) progs[i]->source.content.llvmir.externs);
-            progs[i]->source.content.llvmir.externs        = nullptr;
-            progs[i]->source.content.llvmir.externs_count  = 0;
-            progs[i]->source.content.llvmir._externs_owned = false;
-        }
-    }
-
     return true;
+    };   /* build_fused */
+
+    if (fuse_hit)
+    {
+        if (fuse_cached[0] != 'F')
+            return false;          /* refused before, for the same reasons */
+        bitcode.assign(fuse_cached, 1, std::string::npos);
+    }
+    else
+    {
+        const bool fused = build_fused();
+        if (fuse_key)
+            cache_meta_put(fuse_key, fused ? "F" + bitcode : std::string("R"));
+        if (!fused)
+            return false;
+    }
+    return fuse_install(progs, n, dst, bitcode, S, K, slot_offset, packed_size,
+                        packed_output, device, any_outline, any_packed_leaf);
 
     # endif /* CGIR_SUPPORT_LLVM */
 }
@@ -3325,40 +3815,172 @@ device_runtime_env_params(const llvm::Function & entry)
     return out;
 }
 
+/* What device_instance reads of the entry's signature: which parameters carry a
+ * value it knows (a pointer, or an integer of at most 64 bits) and which are
+ * OpenMP launch environments. Kept per program content key (in the derived-facts
+ * store, so on disk too), it lets a later instance -- or a later run -- compute
+ * the instance values, and so find its artifact, without parsing the IR: the
+ * parse was most of what a warm instance cost (~1 ms each, CloverLeaf: 3884). */
+struct device_arg_schema_t
+{
+    static constexpr uint8_t PTR = 0xFF;   /* kind: pointer; else integer width in bits, 0 = none */
+    std::vector<uint8_t> kind;
+    std::vector<uint8_t> env;
+};
+
+static device_arg_schema_t
+device_arg_schema(const llvm::Function & entry, const env_params_t & envs)
+{
+    device_arg_schema_t s;
+    s.kind.assign(entry.arg_size(), 0);
+    s.env.assign(entry.arg_size(), 0);
+    for (const llvm::Argument & A : entry.args())
+    {
+        const unsigned i = A.getArgNo();
+        llvm::Type *   T = A.getType();
+        if (T->isPointerTy())
+            s.kind[i] = device_arg_schema_t::PTR;
+        else if (T->isIntegerTy() && T->getIntegerBitWidth() <= 64)
+            s.kind[i] = (uint8_t) T->getIntegerBitWidth();
+        if (std::find(envs.begin(), envs.end(), i) != envs.end())
+            s.env[i] = 1;
+    }
+    return s;
+}
+
+static std::string
+device_arg_schema_encode(const device_arg_schema_t & s)
+{
+    std::string b = "S1";
+    b.append(reinterpret_cast<const char *>(s.kind.data()), s.kind.size());
+    b.append(reinterpret_cast<const char *>(s.env.data()),  s.env.size());
+    return b;
+}
+
+static bool
+device_arg_schema_decode(const std::string & b, device_arg_schema_t & s)
+{
+    if (b.size() < 2 || b[0] != 'S' || b[1] != '1' || (b.size() - 2) % 2 != 0)
+        return false;
+    const size_t n = (b.size() - 2) / 2;
+    s.kind.assign(b.begin() + 2, b.begin() + 2 + n);
+    s.env.assign(b.begin() + 2 + n, b.end());
+    return true;
+}
+
+/* The derived-facts key of a program's schema. */
+static uint64_t
+device_arg_schema_key(uint64_t key)
+{
+    static const char tag[] = "cgir.device-arg-schema.v1";
+    return cache_key_extend(key, tag, sizeof(tag));
+}
+
+/* The instance values (`device_instance_t::values`: the key of everything derived
+ * from them) of `prog` for an entry of schema `s`; with `raws`, also each known
+ * parameter and its value as the analyses see it (canonical under trusted). The
+ * one encoding of those bytes, for the parsed and the parse-free paths alike. */
+static std::string
+device_instance_values(const device_arg_schema_t & s, const command_prog_t * prog,
+                       std::vector<std::pair<unsigned, uint64_t>> * raws)
+{
+    /* CGIR_NOALIAS=trusted: a pointer is known by which others it equals, not
+     * by its value (see noalias::canonical_pointers) -- in the analyses and in
+     * `values`, the key of everything derived from them. */
+    const bool canon = noalias::canonical_pointers();
+    std::vector<uint64_t> seen;
+    auto canonical = [&] (uint64_t raw) -> uint64_t {
+        if (raw == 0)
+            return 0;
+        for (size_t k = 0 ; k < seen.size() ; ++k)
+            if (seen[k] == raw)
+                return noalias::canonical_address((unsigned) k);
+        seen.push_back(raw);
+        return noalias::canonical_address((unsigned) (seen.size() - 1));
+    };
+    /* Otherwise (prove, distinct-base) a user-space pointer (pointer_keyed_relative)
+     * is keyed by its offset from the
+     * lowest pointer of the instance, plus that pointer's low 16 bits. What the
+     * analyses decide depends on how the accessed byte ranges compare, i.e. on
+     * the pointers' differences, which moving every pointer by one amount keeps
+     * (and on alignment, which the low bits keep, up to 64 KiB). The keyed form
+     * is what makes the facts and artifacts of a run reusable in the next one:
+     * between runs the allocations land at another base (CloverLeaf on an A100:
+     * every pointer moved by the same 1 GiB multiple), and keyed by value every
+     * instance missed. Pointers that move by different amounts change the
+     * differences, and only miss. The analyses still see the real values. */
+    uint64_t ref = 0;
+    if (!canon)
+        for (unsigned i = 0 ; i < (unsigned) s.kind.size() ; ++i)
+        {
+            if (prog->args == nullptr || i >= prog->n_args || prog->args[i] == nullptr ||
+                s.kind[i] != device_arg_schema_t::PTR || s.env[i])
+                continue ;
+            uint64_t raw = 0;
+            memcpy(&raw, prog->args[i], sizeof(void *));
+            if (pointer_keyed_relative(raw) && (ref == 0 || raw < ref))
+                ref = raw;
+        }
+    std::string values;
+    if (!canon)
+    {
+        const uint64_t low = ref & 0xFFFFu;
+        values.append("R", 1);
+        values.append(reinterpret_cast<const char *>(&low), sizeof(low));
+    }
+    for (unsigned i = 0 ; i < (unsigned) s.kind.size() ; ++i)
+    {
+        if (prog->args == nullptr || i >= prog->n_args || prog->args[i] == nullptr || s.kind[i] == 0)
+            continue ;
+        const bool   ptr   = (s.kind[i] == device_arg_schema_t::PTR);
+        const size_t bytes = ptr ? sizeof(void *) : ((size_t) s.kind[i] + 7) / 8;
+        uint64_t raw = 0;
+        memcpy(&raw, prog->args[i], bytes);
+        if (ptr && canon)
+            raw = canonical(raw);
+        /* An OpenMP launch environment is runtime scratch: no analysis reads its
+         * value (it is in env.runtime_envs, not a base) and no code depends on
+         * it, so it is keyed as present, not by its address -- which moves from
+         * run to run (it is host memory under ASLR) and would otherwise make
+         * every derived fact of a program a miss in the next run. */
+        const uint64_t kraw = s.env[i] ? 0 : (ptr && !canon && pointer_keyed_relative(raw)) ? raw - ref : raw;
+        values.append(reinterpret_cast<const char *>(&i), sizeof(i));
+        values.append(reinterpret_cast<const char *>(&kraw), sizeof(kraw));
+        if (raws)
+            raws->emplace_back(i, raw);
+    }
+    const unsigned g[3] = { prog->grid.x,  prog->grid.y,  prog->grid.z  };
+    const unsigned b[3] = { prog->block.x, prog->block.y, prog->block.z };
+    values.append(reinterpret_cast<const char *>(g), sizeof(g));
+    values.append(reinterpret_cast<const char *>(b), sizeof(b));
+    return values;
+}
+
 static device_instance_t
 device_instance(llvm::Function & entry, const command_prog_t * prog,
                 const env_params_t * env_params = nullptr)
 {
     const env_params_t envs = env_params ? *env_params : device_runtime_env_params(entry);
+    const device_arg_schema_t s = device_arg_schema(entry, envs);
     device_instance_t d;
-    for (llvm::Argument & A : entry.args())
+    std::vector<std::pair<unsigned, uint64_t>> raws;
+    d.values = device_instance_values(s, prog, &raws);
+    for (const auto & [i, raw] : raws)
     {
-        const unsigned i = A.getArgNo();
-        llvm::Type *   T = A.getType();
-        if (prog->args == nullptr || i >= prog->n_args || prog->args[i] == nullptr)
-            continue ;
-        const bool ptr = T->isPointerTy();
-        const bool num = T->isIntegerTy() && T->getIntegerBitWidth() <= 64;
-        if (!ptr && !num)
-            continue ;
-        const size_t bytes = ptr ? sizeof(void *) : (T->getIntegerBitWidth() + 7) / 8;
-        uint64_t raw = 0;
-        memcpy(&raw, prog->args[i], bytes);
-        d.values.append(reinterpret_cast<const char *>(&i), sizeof(i));
-        d.values.append(reinterpret_cast<const char *>(&raw), sizeof(raw));
-        if (std::find(envs.begin(), envs.end(), i) != envs.end())
-            d.env.runtime_envs.push_back(&A);   /* an OpenMP launch environment */
-        else if (ptr)
+        llvm::Argument * A = entry.getArg(i);
+        if (s.env[i])
+            d.env.runtime_envs.push_back(A);   /* an OpenMP launch environment */
+        else if (s.kind[i] == device_arg_schema_t::PTR)
         {
-            d.bases.push_back({&A, raw});
+            d.bases.push_back({A, raw});
             d.base_arg.push_back(i);
         }
         else
         {
-            const unsigned w = T->getIntegerBitWidth();
+            const unsigned w = s.kind[i];
             const int64_t  v = (w == 64) ? (int64_t) raw
                              : (int64_t) (raw << (64 - w)) >> (64 - w);
-            d.env.consts[&A] = v;
+            d.env.consts[A] = v;
         }
     }
     const unsigned g[3] = { prog->grid.x,  prog->grid.y,  prog->grid.z  };
@@ -3368,8 +3990,6 @@ device_instance(llvm::Function & entry, const command_prog_t * prog,
         d.env.grid[k]  = g[k];
         d.env.block[k] = b[k];
     }
-    d.values.append(reinterpret_cast<const char *>(g), sizeof(g));
-    d.values.append(reinterpret_cast<const char *>(b), sizeof(b));
     d.env.globals_private = true;   /* the JIT'd module's globals are its own */
     return d;
 }
@@ -3804,8 +4424,7 @@ device_launch_grids(const command_prog_t * prog)
 {
     if (!prog->grid_flexible)
         return { prog->grid.x };
-    const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm &&
-                          prog->blocks_per_sm != ~0u)
+    const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm)
                        ? prog->max_coresident_blocks / prog->blocks_per_sm : 0;
     unsigned cand[CGIR_GRID_CANDIDATES_MAX];
     const unsigned n = command_prog_grid_candidates(prog->grid.x, nsm, cand);
@@ -4056,6 +4675,52 @@ bitset_bytes(const std::vector<bool> & set)
     return s;
 }
 
+/* CGIR_NOALIAS=prove, warm: the PTX of an instance whose analysis an earlier
+ * instance -- or an earlier run, through the on-disk store -- recorded under the
+ * same instance values (`values`, see device_instance_values). The derived facts
+ * are "bits|plan|indep"; the artifact key is the one the jit pass builds
+ * (set_key: bits|plan|indep|spec, spec = the values for a fused kernel, which is
+ * specialized). Returns 0 on a miss, else the outcome (1 disk, 2 in-process),
+ * with `plan` set. */
+static int
+device_prove_cached(uint64_t key, const std::string & values, std::string & ptx, std::string & plan)
+{
+    const uint64_t vkey = cache_key_extend(key, values.data(), values.size());
+    std::string meta;
+    if (!cache_meta_get(vkey, meta))
+        return 0;
+    const size_t      b1    = meta.find('|');
+    const size_t      b2    = (b1 == std::string::npos) ? b1 : meta.find('|', b1 + 1);
+    const std::string bits  = meta.substr(0, b1);
+    const std::string p     = (b1 == std::string::npos) ? std::string() : meta.substr(b1 + 1, b2 - b1 - 1);
+    const std::string indep = (b2 == std::string::npos) ? std::string() : meta.substr(b2 + 1);
+    const std::string spec  = p.empty() ? std::string() : values;
+    const std::string b     = bits + "|" + p + "|" + indep + "|" + spec;
+    const int hit = cache_device_get(cache_key_extend(key, b.data(), b.size()), ptx);
+    if (hit)
+        plan = p;
+    return hit;
+}
+
+/* Whether `prog` launches as an ordinary kernel or needs its whole grid resident
+ * (a grid-wide barrier remains in its plan); false if it needs it and the grid
+ * cannot be shown resident. */
+static bool
+device_settle_residency(command_prog_t * prog, const std::string & plan)
+{
+    const bool grid = plan.find('2') != std::string::npos;
+    if (grid)
+    {
+        const uint64_t blocks = (uint64_t) prog->grid.x * prog->grid.y * prog->grid.z;
+        const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm)
+                           ? prog->max_coresident_blocks / prog->blocks_per_sm : 0;
+        if (nsm == 0 || blocks > nsm)
+            return false;
+    }
+    prog->requires_coresident_grid = grid;
+    return true;
+}
+
 /* A device kernel in its final, optimized form, before any noalias of ours was
  * added, kept per program (cache_key) for the process lifetime: under
  * CGIR_NOALIAS=prove (and to verify distinct-base) every instance is analysed
@@ -4163,6 +4828,30 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     const bool  dump     = dump_enabled("CGIR_JIT_DUMP");
     std::string dump_dir = dump ? dump_make_dir("CGIR_JIT_DUMP", "jit") : std::string();
 
+    /* CGIR_NOALIAS=prove (the default), warm: an instance of a program already
+     * analysed -- earlier in this run, or in an earlier one through the on-disk
+     * store -- finds its artifact from its argument values alone, given the
+     * program's argument schema (device_arg_schema_t), without parsing the IR.
+     * Exactly the lookup the prove path below makes after parsing; any miss
+     * falls through to it. Not while dumping or verifying, which want the
+     * parsed module. */
+    if (is_device && !dump && noalias::mode() == noalias::MODE_PROVE && !noalias::verify())
+    {
+        std::string         sb;
+        device_arg_schema_t sch;
+        if (cache_meta_get(device_arg_schema_key(key), sb) && device_arg_schema_decode(sb, sch))
+        {
+            std::string ptx, plan;
+            if (const int hit = device_prove_cached(key, device_instance_values(sch, prog, nullptr), ptx, plan))
+                if (device_settle_residency(prog, plan))
+                {
+                    restore_device_ptx(prog, ptx);
+                    if (profiling_stats_on()) profiling_cache_event(true, hit == 1 ? 1 : 2);
+                    return ;
+                }
+        }
+    }
+
     /* parse the program's IR/bitcode into its own context */
     auto ctx = std::make_unique<llvm::LLVMContext>();
     std::unique_ptr<llvm::Module> mod = [&] {
@@ -4246,10 +4935,13 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
          * which the allocator then uses or not as it sees fit -- on the same SpMV
          * it lands on 50 with no spills, i.e. exactly the relocatable result.
          *
-         * Declaring it is also what makes the driver-side occupancy guard a
-         * no-op rather than a repair: the kernel comes out register-limited to
-         * the recorded occupancy on its own, so nothing has to be clawed back
-         * afterwards with a shared-memory carveout or ballast.
+         * It is a floor, not a ceiling: code that comes out leaner than the
+         * recorded program may still be co-scheduled more densely. Nothing
+         * corrects that at launch; CGIR_JIT_VARIANT=auto measures the JIT'd
+         * code against the ahead-of-time one and keeps the faster.
+         *
+         * The PTX also declares `.reqntid` (see declare_exact_block_size),
+         * without which ptxas does not act on `.minnctapersm`.
          *
          * Zero means the runtime could not measure it -- leave ptxas alone. Note
          * the value is an occupancy *floor*: too large a value tightens the
@@ -4328,17 +5020,9 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             if (prog->requires_coresident_grid && !grid && dump)
                 fprintf(stderr, "jit(device): `%s` needs no grid-wide barrier (plan %s): "
                                 "ordinary launch\n", entry_name.c_str(), plan.c_str());
-            if (grid)
-            {
-                const uint64_t blocks = (uint64_t) prog->grid.x * prog->grid.y * prog->grid.z;
-                const unsigned nsm = (prog->max_coresident_blocks && prog->blocks_per_sm &&
-                                      prog->blocks_per_sm != ~0u)
-                                   ? prog->max_coresident_blocks / prog->blocks_per_sm : 0;
-                if (nsm == 0 || blocks > nsm)
-                    fail("barriers", "a grid-wide barrier remains in `" + entry_name +
-                         "` but its grid cannot be shown resident (plan " + plan + ")");
-            }
-            prog->requires_coresident_grid = grid;
+            if (!device_settle_residency(prog, plan))
+                fail("barriers", "a grid-wide barrier remains in `" + entry_name +
+                     "` but its grid cannot be shown resident (plan " + plan + ")");
         };
         const bool fused_markers = (mod->getFunction(CGIR_GRID_BARRIER_MARKER) != nullptr);
 
@@ -4387,29 +5071,24 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             /* A warm run knows this instance's set without the analysis. */
             const device_instance_t inst = device_instance(*entry, prog);
             const uint64_t vkey = cache_key_extend(key, inst.values.data(), inst.values.size());
-            std::string meta;
-            if (cache_meta_get(vkey, meta))
+            /* ...and later instances of this program need not parse it to know
+             * their values (see the parse-free path at the top) */
             {
-                /* "bits|plan|indep" */
-                const size_t b1 = meta.find('|');
-                const size_t b2 = (b1 == std::string::npos) ? b1 : meta.find('|', b1 + 1);
-                const std::string bits = meta.substr(0, b1);
-                plan  = (b1 == std::string::npos) ? std::string() : meta.substr(b1 + 1, b2 - b1 - 1);
-                indep = (b2 == std::string::npos) ? std::string() : meta.substr(b2 + 1);
-                if (!plan.empty())
-                    spec = inst.values;   /* fused kernels are specialized */
-                std::vector<bool> set(bits.size());
-                for (size_t i = 0 ; i < bits.size() ; ++i) set[i] = (bits[i] == '1');
+                const uint64_t sk = device_arg_schema_key(key);
+                std::string    have;
+                if (!dump && !cache_meta_get(sk, have))
+                    cache_meta_put(sk, device_arg_schema_encode(
+                        device_arg_schema(*entry, device_runtime_env_params(*entry))));
+            }
+            {
                 std::string ptx;
-                if (const int hit = cache_device_get(set_key(set), ptx))
+                if (const int hit = device_prove_cached(key, inst.values, ptx, plan))
                 {
                     settle_residency();
                     finish(ptx, hit == 1 ? 1 : 2);
                     return ;
                 }
                 plan.clear();
-                indep.clear();
-                spec.clear();
             }
 
             device_optimized_t * O = lookup_optimized();
@@ -4499,9 +5178,39 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             return ;
         }
 
-        /* none / distinct-base: one pipeline, attributes (if any) up front */
+        /* none / distinct-base / trusted: one pipeline, attributes (if any) up front */
         std::vector<bool> set(entry->arg_size(), false);
-        if (nam == noalias::MODE_DISTINCT_BASE)
+        /* trusted: what a fused kernel's plan and thread independence depend on
+         * is in `values` (pointer equality, scalars, launch), so a warm run --
+         * a later instance, or a later run with the on-disk cache -- reads them
+         * back instead of optimizing twice to rederive them */
+        uint64_t tkey = 0;
+        if (nam == noalias::MODE_TRUSTED && fused_markers && noalias::canonical_pointers())
+        {
+            const device_instance_t inst = device_instance(*entry, prog);
+            const std::string v = "trusted|" + inst.values;
+            tkey = cache_key_extend(key, v.data(), v.size());
+            std::string meta;
+            if (cache_meta_get(tkey, meta))
+            {
+                /* "plan|indep" */
+                const size_t b1 = meta.find('|');
+                plan  = meta.substr(0, b1);
+                indep = (b1 == std::string::npos) ? std::string() : meta.substr(b1 + 1);
+                spec  = inst.values;   /* specialize_for_launch's, as below */
+                std::string ptx;
+                if (const int hit = cache_device_get(set_key(device_noalias_distinct(inst, entry->arg_size())), ptx))
+                {
+                    settle_residency();
+                    finish(ptx, hit == 1 ? 1 : 2);
+                    return ;
+                }
+                plan.clear();
+                indep.clear();
+                spec.clear();
+            }
+        }
+        if (noalias::assume_distinct())
         {
             const device_instance_t inst = device_instance(*entry, prog);
             set = device_noalias_distinct(inst, entry->arg_size());
@@ -4575,6 +5284,8 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
                 strip_block_barriers_and_merge(*mod, *entry, TM.get());
             }
         }
+        if (tkey)
+            cache_meta_put(tkey, plan + "|" + indep);
         const uint64_t skey = (nam == noalias::MODE_NONE && plan.empty()) ? key : set_key(set);
         {
             std::string ptx;

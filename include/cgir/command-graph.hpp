@@ -335,9 +335,8 @@ struct command_graph_t
     bool is_serial = false;
 
     /* Set by the `critical-path` pass when some command of the graph has no
-     * measured duration: the runtime should time the commands while it
-     * replays the graph, then run the pass again (and clear the flag if the
-     * durations never all arrive). */
+     * measured duration (it weighed 0). A runtime may time the commands and
+     * run the pass again, or clear the flag. */
     bool durations_wanted = false;
 
     /** Methods to allocate command, nodes and graphs */

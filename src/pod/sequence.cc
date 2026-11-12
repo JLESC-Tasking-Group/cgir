@@ -174,6 +174,11 @@ command_graph_t::pass_sequence(void)
         assert(B);
         B->command = cmd;
 
+        /* the chain's head starts the longest path through it: the pack gets
+         * its priority (`critical-path`) */
+        if (u->command)
+            cmd->priority = u->command->priority;
+
         /* move the chain's external boundary onto B, leaving the head (u) with no
          * predecessor and the tail with no successor */
         command_graph_pass_sequence_detach_boundary(B, u, tail);

@@ -57,17 +57,19 @@ CGIR_NAMESPACE_BEGIN
  * IMPORTANT: the declaration order below IS the canonical pipeline order. When a
  * set of passes is requested at once (command_graph_t::optimize(command_graph_pass_set_t)),
  * enabled passes are applied in this order. Keep reductions before packing, and
- * packing last. `critical-path` annotates the commands once the program
- * transformations are done, before `sequence`/`pack` group them: the priorities
- * travel with the commands into the packs, whose runtime representation (e.g.
- * a CUDA graph) can use them per node. */
+ * packing last. `critical-path` annotates the commands right after the
+ * reductions, on the graph of the commands that were recorded -- and timed --
+ * before any program transformation. The later passes keep the priorities: a
+ * fused program keeps its chain head's (the chain's largest), the commands
+ * keep theirs inside packs, whose runtime representation (e.g. a CUDA graph)
+ * uses them per node, and a pack gets its members' largest. */
 # define CGIR_FORALL_COMMAND_GRAPH_PASS(F)                                                                                              \
     F(COMMAND_GRAPH_PASS_COPY_FUSE,             pass_copy_fuse,             "copy-fuse",            create_copy_fuse_pass)              \
     F(COMMAND_GRAPH_PASS_REDUCE_NODE,           pass_reduce_node,           "reduce-node",          create_reduce_node_pass)            \
     F(COMMAND_GRAPH_PASS_TRANSITIVE_REDUCTION,  pass_transitive_reduction,  "transitive-reduction", create_transitive_reduction_pass)   \
+    F(COMMAND_GRAPH_PASS_CRITICAL_PATH,         pass_critical_path,         "critical-path",        create_critical_path_pass)          \
     F(COMMAND_GRAPH_PASS_PROG_FUSE,             pass_prog_fuse,             "prog-fuse",            create_prog_fuse_pass)              \
     F(COMMAND_GRAPH_PASS_JIT,                   pass_jit,                   "jit",                  create_jit_pass)                    \
-    F(COMMAND_GRAPH_PASS_CRITICAL_PATH,         pass_critical_path,         "critical-path",        create_critical_path_pass)          \
     F(COMMAND_GRAPH_PASS_SEQUENCE,              pass_sequence,              "sequence",             create_sequence_pass)               \
     F(COMMAND_GRAPH_PASS_PACK,                  pass_pack,                  "pack",                 create_pack_pass)
 

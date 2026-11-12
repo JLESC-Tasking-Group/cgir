@@ -74,14 +74,38 @@ CGIR_NAMESPACE::noalias::mode(void)
                 fprintf(stderr, "cgir: %s was removed and is ignored; see CGIR_NOALIAS "
                                 "and CGIR_JIT_VARIANT\n", gone);
         const char * e = getenv("CGIR_NOALIAS");
-        if (e == nullptr || e[0] == '\0' || strcmp(e, "prove") == 0)
+        if (e == nullptr || e[0] == '\0')
+        {
+            /* Caching asked for explicitly: what prove concludes depends on the
+             * addresses an instance runs with, so its prog-fuse results are only
+             * reusable for identical addresses. trusted makes them reusable
+             * across instances and runs, at the cost of its assumption. */
+            const char * c = getenv("CGIR_JIT_CACHE");
+            const char * d = getenv("CGIR_JIT_CACHE_DIR");
+            const bool off = c && strcmp(c, "0") == 0;
+            const bool on  = (c && c[0] && !off) || (d && d[0] && !off);
+            if (on)
+            {
+                fprintf(stderr, "cgir: warning: caching requested (%s) and CGIR_NOALIAS not set: "
+                                "using CGIR_NOALIAS=trusted -- pointer arguments with different "
+                                "values are assumed never to overlap. Set CGIR_NOALIAS=prove to "
+                                "keep the proofs (prog-fuse results are then reused only for "
+                                "identical argument values).\n",
+                        (d && d[0]) ? "CGIR_JIT_CACHE_DIR" : "CGIR_JIT_CACHE");
+                return MODE_TRUSTED;
+            }
+            return MODE_PROVE;
+        }
+        if (strcmp(e, "prove") == 0)
             return MODE_PROVE;
         if (strcmp(e, "none") == 0)
             return MODE_NONE;
         if (strcmp(e, "distinct-base") == 0)
             return MODE_DISTINCT_BASE;
+        if (strcmp(e, "trusted") == 0)
+            return MODE_TRUSTED;
         fprintf(stderr, "cgir: CGIR_NOALIAS='%s' is not one of none, prove, "
-                        "distinct-base; using prove\n", e);
+                        "distinct-base, trusted; using prove\n", e);
         return MODE_PROVE;
     }();
     return value;
@@ -95,8 +119,32 @@ CGIR_NAMESPACE::noalias::mode_name(policy_t m)
         case MODE_NONE:          return "none";
         case MODE_PROVE:         return "prove";
         case MODE_DISTINCT_BASE: return "distinct-base";
+        case MODE_TRUSTED:       return "trusted";
     }
     return "?";
+}
+
+bool
+CGIR_NAMESPACE::noalias::assume_distinct(void)
+{
+    const policy_t m = mode();
+    return m == MODE_DISTINCT_BASE || m == MODE_TRUSTED;
+}
+
+bool
+CGIR_NAMESPACE::noalias::canonical_pointers(void)
+{
+    /* verification checks the assumption against the real addresses */
+    static const bool value = (mode() == MODE_TRUSTED) && !verify();
+    return value;
+}
+
+uint64_t
+CGIR_NAMESPACE::noalias::canonical_address(unsigned k)
+{
+    /* 1 TiB apart, from 1 TiB: no bounded footprint reaches the next one, and
+     * none is null */
+    return (uint64_t) (k + 1) << 40;
 }
 
 static int
@@ -1237,6 +1285,10 @@ pair_requirement(const access_rec_t & a, const access_rec_t & b,
 
     /* two user buffers */
     const uint64_t va = bases[a.owner.base].addr, vb = bases[b.owner.base].addr;
+    /* trusted: different pointer values are different objects, however far
+     * either footprint reaches (or could not be bounded) */
+    if (va != vb && mode() == MODE_TRUSTED)
+        return BARRIER_NONE;
     if (a.bounded && b.bounded)
     {
         const wide_t alo = (wide_t) va + a.lo, ahi = (wide_t) va + a.hi;

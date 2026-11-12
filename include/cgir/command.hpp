@@ -236,61 +236,27 @@ struct command_prog_t
         unsigned int x, y, z;
     } block;
 
-    /* Occupancy target: how many blocks (CTAs) the device may co-schedule per
-     * SM/CU. 0 = unset, let the device decide.
+    /* Occupancy of the program, in blocks (CTAs) per SM/CU, as recorded before
+     * a pass rewrote it. 0 = unknown.
      *
-     * grid and block say how much work is launched; this says how much of it the
-     * device runs at once. That is a third, independent launch parameter, and it
-     * is one a *code* transformation changes by accident: occupancy is decided by
-     * the per-block resources the compiler happened to use (registers, shared
-     * memory, barriers), so a pass that rewrites a program -- the `jit` pass
-     * recompiling it, `prog-fuse` merging several -- generally produces code the
-     * hardware co-schedules differently. That is not a neutral change: a program
-     * whose speed rests on cache reuse slows down when more of its blocks run
-     * concurrently and compete for the same cache, and the loss can be several x
-     * even when the emitted instructions are identical.
+     * Occupancy follows from the per-block resources the compiler happened to
+     * use (registers, shared memory, barriers), so a pass that rewrites a
+     * program -- `jit` recompiling it, `prog-fuse` merging several -- generally
+     * changes it. A producer records it here before command_graph_t::optimize
+     * (in xkrt, from driver_t::f_prog_max_blocks_per_sm), and the `jit` pass
+     * declares it to the device assembler (NVPTX: `.minnctapersm`, with
+     * `.reqntid`). An assembler given no occupancy target assumes full
+     * occupancy and sizes the register budget for it; told the recorded one,
+     * it gives the new code the register budget of the original.
      *
-     * So a producer records here the occupancy of the program it is about to have
-     * rewritten (in xkrt, from driver_t::f_prog_max_blocks_per_sm just before
-     * command_graph_t::optimize), and the driver holds the replacement to it --
-     * in both directions: code that is co-scheduled more densely floods the
-     * cache, code that is co-scheduled more sparsely starves the device of
-     * parallelism. Enforcement is the driver's business and must use a resource
-     * the hardware accounts *per block* -- shrinking the launch grid does not
-     * work, because other blocks (of the same program or of a concurrent one)
-     * simply take the freed slots.
+     * The declaration is a floor: rewritten code may still come out leaner and
+     * be co-scheduled more densely. That is not corrected at launch; see
+     * aot_variant (CGIR_JIT_VARIANT=auto), which keeps the faster of the two.
      *
-     * Two consumers, in this order:
-     *
-     *   - the `jit` pass, at codegen time, which declares it to the device
-     *     assembler (NVPTX: `.minnctapersm`). This is the one that matters: an
-     *     assembler given no occupancy target assumes the kernel wants full
-     *     occupancy and sizes the register budget for it, which for a
-     *     bandwidth-bound kernel spends registers on warps it cannot use. Told
-     *     the real target, it emits code that is *already* limited to it, and
-     *     keeps the registers. Hence the requirement that a producer fill this
-     *     in before command_graph_t::optimize, not merely before the launch.
-     *
-     *   - the driver, at first launch, as a backstop for whatever the assembler
-     *     did anyway -- and for programs whose code the JIT never saw.
-     *
-     * A backstop should be read with tolerance. The levers a driver has are coarse
-     * (a shared-memory carveout is rounded to the device's own buckets, a register
-     * cap moves residency in whole blocks), so insisting on the exact figure
-     * usually means overshooting it, and overshooting downwards does the same harm
-     * as the drift being corrected -- measured at 35% of a reduction kernel's
-     * runtime, to correct a 20% drift. xkrt enforces past a factor of 1.5 either
-     * way and otherwise leaves the program alone.
-     *
-     * A driver may clear or overwrite the field once consumed (it is a request,
-     * not a durable record). */
+     * Also gives, with max_coresident_blocks, the number of SMs. */
     unsigned int blocks_per_sm;
 
-    /* Dynamic (per-block) shared memory to reserve at launch, in bytes. 0 = none.
-     * Both a real requirement of the program and the last-resort lever a driver
-     * has to hold it to `blocks_per_sm` when no cheaper per-block resource
-     * suffices -- shared-memory capacity bounds residency, at the cost of the L1
-     * it shares its budget with on most devices. */
+    /* Dynamic (per-block) shared memory to reserve at launch, in bytes. 0 = none. */
     unsigned int dyn_shmem;
 
     /* How many blocks of THIS program the device can run at the same time, i.e.
@@ -313,6 +279,15 @@ struct command_prog_t
      * it like an ordinary kernel risks a hang. */
     bool requires_coresident_grid;
 
+    /* The state of the grid-wide barriers of a fused device program (above): a
+     * cell in `args` holding a device pointer to 2 x uint32 (arrival count,
+     * generation), zero-initialized, passed as the kernel's last parameter.
+     * NULL for any other program. The cell holds NULL until the runtime, before
+     * the first cooperative launch, points it at memory of this program's own:
+     * the barrier state is per program, never shared with another launch, even
+     * one of the same kernel code. */
+    void ** grid_barrier_state;
+
     /* The ahead-of-time implementation of a device program the `jit` pass
      * recompiled, kept beside the JIT'd one so the runtime can measure both and
      * launch the faster (CGIR_JIT_VARIANT=auto, the default).
@@ -328,8 +303,7 @@ struct command_prog_t
      * `fn` is the kernel handle the program held before the pass (NULL: there
      * is no alternative -- the program was never compiled ahead of time, e.g.
      * it was synthesized by prog-fuse -- or the mode is not `auto`), and
-     * `dyn_shmem` the dynamic shared memory it was launched with, which the
-     * runtime may since have changed for the JIT'd code (see blocks_per_sm).
+     * `dyn_shmem` the dynamic shared memory it was launched with.
      * Both variants take the same `args`: the JIT recompiles the very same
      * kernel, so its signature is unchanged.
      *
@@ -439,9 +413,10 @@ struct command_t
     /* the command type */
     command_type_t type;
 
-    /* Measured execution time of the command, in nanoseconds: its best timed
-     * execution, recorded by the runtime while replaying the graph. 0 when not
-     * measured (yet). Read by the `critical-path` pass. */
+    /* Measured execution time of the command, in nanoseconds, set by the
+     * runtime (e.g. while recording the graph). 0 when not measured. Read by
+     * the `critical-path` pass; `prog-fuse` gives a fused program the sum of
+     * its members'. */
     uint64_t duration = 0;
 
     /* Launch priority, set by the `critical-path` pass: the command's bottom
@@ -514,6 +489,7 @@ struct command_t
              * barrier and needs no special launch. Both are the safe defaults. */
             prog.max_coresident_blocks   = 0;
             prog.requires_coresident_grid = false;
+            prog.grid_barrier_state       = nullptr;
             /* no alternative implementation until the jit pass keeps one */
             prog.aot_variant.fn        = nullptr;
             prog.aot_variant.dyn_shmem = 0;

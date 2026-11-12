@@ -273,6 +273,12 @@ command_graph_t::pass_pack(void)
         for (command_graph_node_t * m : members)
             nodes[m->iterator_index].data.rep = B;
 
+        /* the pack starts its members' critical paths: it gets their largest
+         * priority (`critical-path`), the one of its first command(s) */
+        for (command_graph_node_t * m : members)
+            if (m->type == COMMAND_GRAPH_NODE_TYPE_COMMAND && m->command)
+                cmd->priority = std::max(cmd->priority, m->command->priority);
+
         mat[kv.first] = island_mat_t{ sub, s_entry, s_exit };
     }
 

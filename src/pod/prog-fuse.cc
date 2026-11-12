@@ -123,6 +123,15 @@ command_graph_t::pass_prog_fuse(void)
         if (!command_graph_prog_fuse_llvmir(progs.data(), progs.size(), &u->command->prog))
             continue ;
 
+        /* the fused program does the work of the whole chain: it weighs its
+         * members' durations; unknown (0) if one is. Its priority stays the
+         * head's (`critical-path` ran before): the head's bottom level covers
+         * the whole chain, the largest of the chain's. */
+        uint64_t duration = 0;
+        for (command_graph_node_t * c : chain)
+            duration = (duration == UINT64_MAX || c->command->duration == 0) ? UINT64_MAX : duration + c->command->duration;
+        u->command->duration = (duration == UINT64_MAX) ? 0 : duration;
+
         /* Contract the chain into u (each successive node absorbed in series). */
         for (size_t k = 1 ; k < chain.size() ; ++k)
         {
