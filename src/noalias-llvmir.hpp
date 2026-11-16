@@ -9,58 +9,37 @@
 **/
 
 /*
- *  Aliasing policy and analysis shared by the prog-fuse and jit passes.
+ *  The aliasing and barrier analysis shared by the prog-fuse and jit passes.
  *
- *  CGIR may tell LLVM that two pointers of a program do not alias -- `noalias`
- *  on a kernel parameter, or scoped-noalias metadata between the deduplicated
- *  captures of a fused program. A task runtime can afford to say it where a
- *  compiler cannot, because it knows the actual pointer values a recorded
- *  program is replayed with. What it says is chosen by one knob:
+ *  A compiler cannot tell LLVM that two pointer arguments of a kernel do not
+ *  overlap (an `omp target`'s mapped list items need not be distinct objects).
+ *  A task runtime knows the actual values a recorded program is replayed with,
+ *  so CGIR proves it, per instance, on the program's final code: every access is
+ *  attributed to a base pointer whose runtime value is known, its byte range is
+ *  bounded with ScalarEvolution evaluated over the actual scalar arguments and
+ *  launch dimensions, and two bases are declared disjoint only when their ranges
+ *  do not overlap (or neither side writes). Only direct accesses are bounded: an
+ *  access through a pointer loaded from memory is "unknown" and defeats the
+ *  proof for any base it might conflict with. Nothing is assumed: sound.
  *
- *    CGIR_NOALIAS=prove          (default) mark a pair only when an analysis of
- *                                the program's final code proves it: every
- *                                access is attributed to a base pointer whose
- *                                runtime value is known, its byte range is
- *                                bounded with ScalarEvolution evaluated over the
- *                                actual scalar arguments and launch dimensions,
- *                                and the two ranges are disjoint (or neither
- *                                side writes). Only direct accesses are bounded:
- *                                an access through a pointer loaded from memory
- *                                is "unknown" and defeats the proof for any
- *                                parameter it might conflict with. Sound.
- *    CGIR_NOALIAS=distinct-base  assume that pointers with different runtime
- *                                values never overlap, so pointer deduplication
- *                                is enough (the CGO'26 behaviour). An assumption
- *                                about the program, not a deduction.
- *    CGIR_NOALIAS=trusted        trust the program entirely: pointers with different
- *                                runtime values never overlap, anywhere -- for the
- *                                noalias marks (as distinct-base) and for the grid
- *                                barriers of fused kernels, whose conflicts are then
- *                                only between accesses through the same pointer
- *                                value. No footprint is ever compared: the analyses
- *                                see each pointer as a synthetic address that only
- *                                says which arguments share a value, so every
- *                                decision depends on the equality pattern of the
- *                                pointers, the scalars and the launch -- never on
- *                                the addresses themselves. That is what makes
- *                                prog-fuse cacheable across instances and runs.
- *                                An assumption, like distinct-base, and a stronger
- *                                one: wrong for a program that passes two views of
- *                                one buffer (A and A+n) to the same kernel.
- *                                The default when caching is explicitly asked for
- *                                (CGIR_JIT_CACHE=1, or CGIR_JIT_CACHE_DIR set)
- *                                and CGIR_NOALIAS is not set; a warning says so.
- *    CGIR_NOALIAS=none           never mark anything.
+ *  What it is used for:
+ *   - `noalias` on the pointer parameters of a JIT'd device kernel, and
+ *     scoped-noalias metadata between the captures of a fused host program
+ *     (what enables vectorization, loop fusion, load forwarding, and the
+ *     read-only data path);
+ *   - the synchronization a fused device kernel needs between its bodies
+ *     (barrier_requirements: none, block, or grid-wide), and whether it is
+ *     thread-independent (its block barriers can go and its loops merge).
  *
- *    CGIR_NOALIAS_VERIFY=1       run the prover on every assumption made under
- *                                distinct-base and report it: proven disjoint, or
- *                                not proven -- either because a footprint could
- *                                not be bounded, or because the bounded footprints
- *                                overlap with a write (a possible violation: the
- *                                bounds over-approximate, so it is not certain).
- *                                A summary is printed at exit. Under prove it
- *                                reports how many candidates were proven.
- *                                `=abort` aborts on the first possible violation.
+ *    CGIR_NOALIAS_DEBUG=1        print, per analysed kernel, each pointer's
+ *                                footprint and each fused kernel's barrier plan;
+ *                                =2 also each offset that could not be bounded
+ *                                and each call reaching a base.
+ *    CGIR_NOALIAS_DUMP=<dir>     keep the specialized copies the analysis ran on.
+ *
+ *  The former policy knobs (CGIR_NOALIAS, CGIR_NOALIAS_MODE,
+ *  CGIR_PROG_FUSE_BARRIER_MODE, CGIR_NOALIAS_VERIFY) were removed on 2026-11-15:
+ *  set, they are ignored with a warning (warn_removed_knobs).
  *
  *  Internal to src/; not installed.
  */
@@ -85,25 +64,8 @@
 CGIR_NAMESPACE_BEGIN
 namespace noalias {
 
-enum policy_t { MODE_NONE, MODE_PROVE, MODE_DISTINCT_BASE, MODE_TRUSTED };
-
-/* CGIR_NOALIAS, read once. Folded into the JIT cache salt. */
-policy_t mode(void);
-const char * mode_name(policy_t m);
-
-/* Whether pointer arguments with distinct values are assumed not to alias
- * (distinct-base, trusted) rather than proven or left alone. */
-bool assume_distinct(void);
-
-/* Whether the analyses see synthetic pointer values (trusted, unless verifying):
- * the k-th distinct non-null pointer value of an instance becomes
- * canonical_address(k), so that what they conclude depends on which pointers are
- * equal and not on where they point. */
-bool canonical_pointers(void);
-uint64_t canonical_address(unsigned k);
-
-/* CGIR_NOALIAS_VERIFY, read once. */
-bool verify(void);
+/* Warn, once, about the removed policy knobs if any is set. */
+void warn_removed_knobs(void);
 
 /* A pointer of the analysed function whose runtime value is known: a kernel
  * parameter, or a captured base loaded from a fused program's args buffer. */
@@ -220,13 +182,6 @@ std::vector<barrier_t> barrier_requirements(llvm::Function & F,
  * another thread can observe, and all of them may go -- which, between two
  * fused bodies, lets their loops merge. */
 bool thread_independent(llvm::Function & F, const std::vector<base_t> & bases, const env_t & env);
-
-/* Verification and statistics (printed at exit when CGIR_NOALIAS_VERIFY is set). */
-void report_proven(unsigned proven, unsigned candidates);
-/* An assumption made under distinct-base, checked: `what` names the pair. */
-void report_assumption(const std::string & what,
-                       const footprint_t & a, uint64_t va,
-                       const footprint_t & b, uint64_t vb);
 
 } /* namespace noalias */
 CGIR_NAMESPACE_END

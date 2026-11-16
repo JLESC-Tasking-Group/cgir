@@ -65,104 +65,18 @@ using namespace CGIR_NAMESPACE::noalias;
  * Knobs
  * ------------------------------------------------------------------------- */
 
-policy_t
-CGIR_NAMESPACE::noalias::mode(void)
+void
+CGIR_NAMESPACE::noalias::warn_removed_knobs(void)
 {
-    static const policy_t value = [] {
-        for (const char * gone : { "CGIR_JIT_DEVICE_NOALIAS", "CGIR_JIT_AOT_DEVICE" })
-            if (getenv(gone))
-                fprintf(stderr, "cgir: %s was removed and is ignored; see CGIR_NOALIAS "
-                                "and CGIR_JIT_VARIANT\n", gone);
-        const char * e = getenv("CGIR_NOALIAS");
-        if (e == nullptr || e[0] == '\0')
-        {
-            /* Caching asked for explicitly: what prove concludes depends on the
-             * addresses an instance runs with, so its prog-fuse results are only
-             * reusable for identical addresses. trusted makes them reusable
-             * across instances and runs, at the cost of its assumption. */
-            const char * c = getenv("CGIR_JIT_CACHE");
-            const char * d = getenv("CGIR_JIT_CACHE_DIR");
-            const bool off = c && strcmp(c, "0") == 0;
-            const bool on  = (c && c[0] && !off) || (d && d[0] && !off);
-            if (on)
-            {
-                fprintf(stderr, "cgir: warning: caching requested (%s) and CGIR_NOALIAS not set: "
-                                "using CGIR_NOALIAS=trusted -- pointer arguments with different "
-                                "values are assumed never to overlap. Set CGIR_NOALIAS=prove to "
-                                "keep the proofs (prog-fuse results are then reused only for "
-                                "identical argument values).\n",
-                        (d && d[0]) ? "CGIR_JIT_CACHE_DIR" : "CGIR_JIT_CACHE");
-                return MODE_TRUSTED;
-            }
-            return MODE_PROVE;
-        }
-        if (strcmp(e, "prove") == 0)
-            return MODE_PROVE;
-        if (strcmp(e, "none") == 0)
-            return MODE_NONE;
-        if (strcmp(e, "distinct-base") == 0)
-            return MODE_DISTINCT_BASE;
-        if (strcmp(e, "trusted") == 0)
-            return MODE_TRUSTED;
-        fprintf(stderr, "cgir: CGIR_NOALIAS='%s' is not one of none, prove, "
-                        "distinct-base, trusted; using prove\n", e);
-        return MODE_PROVE;
+    static const bool done = [] {
+        for (const char * gone : { "CGIR_NOALIAS", "CGIR_NOALIAS_MODE", "CGIR_PROG_FUSE_BARRIER_MODE",
+                                   "CGIR_NOALIAS_VERIFY", "CGIR_JIT_DEVICE_NOALIAS", "CGIR_JIT_AOT_DEVICE" })
+            if (const char * e = getenv(gone); e && e[0])
+                fprintf(stderr, "cgir: %s was removed and is ignored: aliasing and fused-kernel "
+                                "barriers are always proven (see noalias-llvmir.hpp)\n", gone);
+        return true;
     }();
-    return value;
-}
-
-const char *
-CGIR_NAMESPACE::noalias::mode_name(policy_t m)
-{
-    switch (m)
-    {
-        case MODE_NONE:          return "none";
-        case MODE_PROVE:         return "prove";
-        case MODE_DISTINCT_BASE: return "distinct-base";
-        case MODE_TRUSTED:       return "trusted";
-    }
-    return "?";
-}
-
-bool
-CGIR_NAMESPACE::noalias::assume_distinct(void)
-{
-    const policy_t m = mode();
-    return m == MODE_DISTINCT_BASE || m == MODE_TRUSTED;
-}
-
-bool
-CGIR_NAMESPACE::noalias::canonical_pointers(void)
-{
-    /* verification checks the assumption against the real addresses */
-    static const bool value = (mode() == MODE_TRUSTED) && !verify();
-    return value;
-}
-
-uint64_t
-CGIR_NAMESPACE::noalias::canonical_address(unsigned k)
-{
-    /* 1 TiB apart, from 1 TiB: no bounded footprint reaches the next one, and
-     * none is null */
-    return (uint64_t) (k + 1) << 40;
-}
-
-static int
-verify_level(void)
-{
-    static const int value = [] {
-        const char * e = getenv("CGIR_NOALIAS_VERIFY");
-        if (e == nullptr || e[0] == '\0' || strcmp(e, "0") == 0)
-            return 0;
-        return strcmp(e, "abort") == 0 ? 2 : 1;
-    }();
-    return value;
-}
-
-bool
-CGIR_NAMESPACE::noalias::verify(void)
-{
-    return verify_level() > 0;
+    (void) done;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1285,10 +1199,6 @@ pair_requirement(const access_rec_t & a, const access_rec_t & b,
 
     /* two user buffers */
     const uint64_t va = bases[a.owner.base].addr, vb = bases[b.owner.base].addr;
-    /* trusted: different pointer values are different objects, however far
-     * either footprint reaches (or could not be bounded) */
-    if (va != vb && mode() == MODE_TRUSTED)
-        return BARRIER_NONE;
     if (a.bounded && b.bounded)
     {
         const wide_t alo = (wide_t) va + a.lo, ahi = (wide_t) va + a.hi;
@@ -1468,88 +1378,6 @@ bool
 CGIR_NAMESPACE::noalias::bounded_conflict(const footprint_t & a, uint64_t va, const footprint_t & b, uint64_t vb)
 {
     return a.bounded && b.bounded && may_conflict(a, va, b, vb);
-}
-
-/* ---------------------------------------------------------------------------
- * Reporting
- * ------------------------------------------------------------------------- */
-
-namespace {
-
-struct report_t
-{
-    std::mutex mtx;
-    unsigned   proven = 0, candidates = 0;           /* prove */
-    unsigned   assumed = 0, verified = 0, unbounded = 0, overlapping = 0;  /* distinct-base */
-
-    ~report_t()
-    {
-        if (!verify_level())
-            return ;
-        fprintf(stderr, "[cgir noalias] mode=%s", mode_name(mode()));
-        if (candidates)
-            fprintf(stderr, ": %u of %u candidates proven noalias", proven, candidates);
-        if (assumed)
-            fprintf(stderr, "%s %u assumed disjoint: %u proven, %u not proven (footprint unbounded), "
-                            "%u not proven (bounded footprints overlap: possible violations)",
-                    candidates ? ";" : ":", assumed, verified, unbounded, overlapping);
-        if (!candidates && !assumed)
-            fprintf(stderr, ": nothing to check");
-        fputc('\n', stderr);
-    }
-};
-
-static report_t &
-report(void)
-{
-    static report_t r;
-    return r;
-}
-
-} /* anonymous namespace */
-
-void
-CGIR_NAMESPACE::noalias::report_proven(unsigned proven, unsigned candidates)
-{
-    if (!verify_level())
-        return ;
-    std::lock_guard<std::mutex> lk(report().mtx);
-    report().proven     += proven;
-    report().candidates += candidates;
-}
-
-void
-CGIR_NAMESPACE::noalias::report_assumption(const std::string & what,
-                                           const footprint_t & a, uint64_t va,
-                                           const footprint_t & b, uint64_t vb)
-{
-    if (!verify_level())
-        return ;
-    /* only a pair that could matter: both accessed, one of them written */
-    if (!a.accessed() || !b.accessed() || !(a.mod || b.mod))
-        return ;
-    /* Footprints are over-approximations, so an overlap of bounds never
-     * certifies an actual overlap: an assumption is either proven, or not. The
-     * bounded-but-overlapping case is the one worth a look (a possible
-     * violation); an unbounded footprint just could not be analysed. */
-    const bool proven   = !may_conflict(a, va, b, vb);
-    const bool overlap  = !proven && bounded_conflict(a, va, b, vb);
-    {
-        std::lock_guard<std::mutex> lk(report().mtx);
-        report().assumed++;
-        if (proven)       report().verified++;
-        else if (overlap) report().overlapping++;
-        else              report().unbounded++;
-    }
-    if (overlap)
-    {
-        fprintf(stderr, "cgir: noalias assumption not proven in %s (possible violation): "
-                        "[%#llx+%lld, +%lld) %s vs [%#llx+%lld, +%lld) %s overlap\n", what.c_str(),
-                (unsigned long long) va, (long long) a.lo, (long long) a.hi, a.mod ? "written" : "read",
-                (unsigned long long) vb, (long long) b.lo, (long long) b.hi, b.mod ? "written" : "read");
-        if (verify_level() > 1)
-            abort();
-    }
 }
 
 # endif /* CGIR_SUPPORT_LLVM */

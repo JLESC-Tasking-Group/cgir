@@ -381,8 +381,8 @@ jit_static_salt(void)
             &CGIR_JIT_CACHE_FORMAT, sizeof(CGIR_JIT_CACHE_FORMAT));
         /* codegen-affecting knobs must be part of the key, or the on-disk cache
          * would hand back PTX built under a different assumption */
-        const char knobs[3] = {
-            (char) noalias::mode(),
+        noalias::warn_removed_knobs();
+        const char knobs[2] = {
             (char) (device_lto_pipeline()            ? 1 : 0),
             (char) (device_declare_min_ctas_per_sm() ? 1 : 0),
         };

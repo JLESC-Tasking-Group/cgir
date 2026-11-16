@@ -385,7 +385,7 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
 }
 
 /* Attach shared-domain scoped-noalias metadata between the deduplicated captures
- * of a fused host program, as CGIR_NOALIAS says (see noalias-llvmir.hpp).
+ * of a fused host program, where the analysis proves it (noalias-llvmir.hpp).
  *
  * Every argument-slot load the wrapper hoists carries "cgir.fuse.slot" (its
  * unique slot index), and `slot_addr[k]` is the slot's runtime &value, which
@@ -393,12 +393,8 @@ prefix_functions(llvm::Module & M, const std::string & prefix)
  * slot loads marked "cgir.fuse.base"; the integer-typed ones give the analysis
  * the scalars (loop bounds, offsets) it needs to bound footprints. Each base
  * gets a scope, and every access attributed to base i is declared not to alias
- * the scopes of the bases j it is disjoint from:
- *
- *   prove          the analysis bounds both footprints and they do not overlap
- *                  (or neither is written);
- *   distinct-base  the two bases have different runtime values -- the slot
- *                  deduplication is then all the evidence there is.
+ * the scopes of the bases j it is disjoint from: the analysis bounds both
+ * footprints and they do not overlap (or neither is written).
  *
  * Pairwise, not all-or-nothing: one unprovable pair does not cost the others.
  * Only tagged accesses are affected, so accesses the analysis could not
@@ -412,8 +408,7 @@ tag_noalias_domains(llvm::Function & F,
                     const std::vector<void *> * slot_addr,
                     const std::vector<size_t> * slot_size)
 {
-    const noalias::policy_t mode = noalias::mode();
-    if (mode == noalias::MODE_NONE || slot_addr == nullptr)
+    if (slot_addr == nullptr)
         return ;
 
     llvm::LLVMContext & ctx = F.getContext();
@@ -455,41 +450,16 @@ tag_noalias_domains(llvm::Function & F,
     if (bases.size() < 2)
         return ;
 
-    const bool analyse = (mode == noalias::MODE_PROVE) || noalias::verify();
-    noalias::result_t r;
-    if (analyse)
-        r = noalias::analyze(F, bases, env);
+    const noalias::result_t r = noalias::analyze(F, bases, env);
 
     const size_t n = bases.size();
     std::vector<std::vector<bool>> disjoint(n, std::vector<bool>(n, false));
-    unsigned proven = 0, candidates = 0;
     for (size_t i = 0 ; i < n ; ++i)
         for (size_t j = i + 1 ; j < n ; ++j)
         {
-            bool d;
-            if (noalias::assume_distinct())
-            {
-                d = (bases[i].addr != bases[j].addr);
-                if (d && noalias::verify())
-                    noalias::report_assumption(
-                        "fused program `" + F.getParent()->getModuleIdentifier() + "` bases " +
-                        std::to_string(i) + "," + std::to_string(j),
-                        r.base[i], bases[i].addr, r.base[j], bases[j].addr);
-            }
-            else
-            {
-                const noalias::footprint_t & a = r.base[i], & b = r.base[j];
-                d = !noalias::may_conflict(a, bases[i].addr, b, bases[j].addr);
-                if (a.accessed() && b.accessed() && (a.mod || b.mod))
-                {
-                    ++candidates;
-                    if (d) ++proven;
-                }
-            }
+            const bool d = !noalias::may_conflict(r.base[i], bases[i].addr, r.base[j], bases[j].addr);
             disjoint[i][j] = disjoint[j][i] = d;
         }
-    if (mode == noalias::MODE_PROVE)
-        noalias::report_proven(proven, candidates);
 
     llvm::MDBuilder mdb(ctx);
     llvm::MDNode * domain = mdb.createAnonymousAliasScopeDomain("cgir.prog-fuse");
@@ -1512,8 +1482,7 @@ fuse_result_key(command_prog_t ** progs, size_t n, const fuse_layout_t & L, cons
     std::string sig = "cgir.prog-fuse.v2";
     auto put = [&] (const void * p, size_t sz) { sig.append(static_cast<const char *>(p), sz); };
     auto put_str = [&] (const char * s) { if (s) put(s, strlen(s)); put("", 1); };
-    const char knobs[3] = { (char) noalias::mode(), (char) (noalias::canonical_pointers() ? 1 : 0),
-                            (char) (packed_output ? 1 : 0) };
+    const char knobs[1] = { (char) (packed_output ? 1 : 0) };
     put(knobs, sizeof(knobs));
     put_str(getenv("CGIR_PROG_FUSE_GRID_BARRIER"));
     put(&n, sizeof(n));
@@ -1540,28 +1509,24 @@ fuse_result_key(command_prog_t ** progs, size_t n, const fuse_layout_t & L, cons
     put(&total_args, sizeof(total_args));
     /* the argument values, one unique slot at a time */
     auto slot_is_ptr  = [&] (unsigned k) { return K[k].typed ? K[k].is_ptr : (bool) S.is_ref[k]; };
-    std::vector<uint64_t> seen;   /* trusted: pointer values by first occurrence */
-    /* otherwise pointers by their offset from the lowest one, plus its low
+    /* pointers by their offset from the lowest one, plus its low
      * 16 bits: what the legality analysis decides depends on how the
      * accessed ranges compare, which moving every pointer by one amount
      * keeps -- and between runs the allocations do move, all by one
      * amount (see device_instance_values, keyed the same way) */
     uint64_t ref = 0;
-    if (!noalias::canonical_pointers())
+    for (unsigned k = 0 ; k < total_args ; ++k)
     {
-        for (unsigned k = 0 ; k < total_args ; ++k)
-        {
-            if (S.unique[k] == nullptr || !slot_is_ptr(k))
-                continue ;
-            uint64_t v = 0;
-            memcpy(&v, S.unique[k], sizeof(void *));
-            if (pointer_keyed_relative(v) && (ref == 0 || v < ref))
-                ref = v;
-        }
-        const uint64_t low = ref & 0xFFFFu;
-        put("R", 1);
-        put(&low, sizeof(low));
+        if (S.unique[k] == nullptr || !slot_is_ptr(k))
+            continue ;
+        uint64_t v = 0;
+        memcpy(&v, S.unique[k], sizeof(void *));
+        if (pointer_keyed_relative(v) && (ref == 0 || v < ref))
+            ref = v;
     }
+    const uint64_t low = ref & 0xFFFFu;
+    put("R", 1);
+    put(&low, sizeof(low));
     for (unsigned k = 0 ; k < total_args ; ++k)
     {
         const void * at = S.unique[k];
@@ -1570,14 +1535,7 @@ fuse_result_key(command_prog_t ** progs, size_t n, const fuse_layout_t & L, cons
         {
             uint64_t v = 0;
             memcpy(&v, at, sizeof(void *));
-            if (noalias::canonical_pointers() && v != 0)
-            {
-                size_t c = 0;
-                while (c < seen.size() && seen[c] != v) ++c;
-                if (c == seen.size()) seen.push_back(v);
-                v = noalias::canonical_address((unsigned) c);
-            }
-            else if (pointer_keyed_relative(v))
+            if (pointer_keyed_relative(v))
                 v -= ref;
             put("P", 1);
             put(&v, sizeof(v));
@@ -2020,7 +1978,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *  which stores the layout for next time. Not while dumping or          *
      *  verifying, which want the parse path's work.                        *
      * ------------------------------------------------------------------ */
-    const uint64_t layout_key = (!dump && !noalias::verify()) ? fuse_layout_key(progs, n) : 0;
+    const uint64_t layout_key = !dump ? fuse_layout_key(progs, n) : 0;
     bool layout_stored = false;
     if (layout_key)
     {
@@ -2546,13 +2504,11 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *  device chain that must lose its grid barrier the legality analysis  *
      *  (a whole second device pipeline) -- is a function of what the key   *
      *  covers: the inputs' code (their JIT content keys, which carry the   *
-     *  toolchain salt and CGIR_NOALIAS), their launch and occupancy        *
-     *  fields, how the deduplication mapped their parameters, the prog-fuse *
-     *  knobs, and the argument values. Under CGIR_NOALIAS=trusted the       *
-     *  pointer values enter only as their equality pattern, because no      *
-     *  decision depends on more (see noalias::canonical_pointers); under    *
-     *  the other modes the exact bytes do, which is still sound and reuses  *
-     *  the result for the instances that repeat them. The fused bitcode is  *
+     *  toolchain salt), their launch and occupancy fields, how the         *
+     *  deduplication mapped their parameters, the prog-fuse knobs, and the *
+     *  argument values (pointers relative to the lowest one, as for the    *
+     *  jit pass), which is sound and reuses the result for the instances   *
+     *  that repeat them. The fused bitcode is                              *
      *  cached, and so is a refusal (most chains are refused, and refusing   *
      *  is what the legality analysis costs). The args buffer and launch     *
      *  fields are not: they are rebuilt below from this instance.          *
@@ -2563,7 +2519,7 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
      *  void** slice, a nanos6 outline).                                    *
      * ------------------------------------------------------------------ */
     uint64_t fuse_key = 0;
-    if (!dump && !noalias::verify())
+    if (!dump)
         fuse_key = fuse_result_key(progs, n, L, S, K, packed_output);
     /* what the parse-free path (0b) needs to compute this key next time */
     if (fuse_key && layout_key && layout_exact && !layout_stored)
@@ -2604,26 +2560,8 @@ CGIR_NAMESPACE::command_graph_prog_fuse_llvmir(
             ab.removeAttribute(llvm::Attribute::AlwaysInline);
             wrapper->addFnAttrs(ab);
         }
-        /* CGIR_NOALIAS=distinct-base: captured pointers with distinct VALUES
-         * are assumed not to overlap. By value, not by slot: dedup merges slots
-         * by address for device leaves, so two slots may still hold the same
-         * pointer, and marking both would be wrong even under the assumption.
-         * Under `prove` nothing is marked here: the jit pass analyses the fused
-         * kernel in its final form and marks what it can prove. */
-        if (noalias::assume_distinct())
-            for (unsigned k = 0 ; k < total_args ; ++k)
-            {
-                if (!ptypes[k]->isPointerTy() || unique_slots[k] == nullptr)
-                    continue ;
-                void * vk = *static_cast<void * const *>(unique_slots[k]);
-                bool unique = (vk != nullptr);
-                for (unsigned j = 0 ; unique && j < total_args ; ++j)
-                    if (j != k && ptypes[j]->isPointerTy() && unique_slots[j] != nullptr &&
-                        *static_cast<void * const *>(unique_slots[j]) == vk)
-                        unique = false;
-                if (unique)
-                    wrapper->addParamAttr(k, llvm::Attribute::NoAlias);
-            }
+        /* No noalias is marked here: the jit pass analyses the fused kernel in
+         * its final form and marks what it can prove. */
 
         llvm::BasicBlock * bb = llvm::BasicBlock::Create(llvmctx, "entry", wrapper);
         llvm::IRBuilder<> builder(bb);
@@ -3771,7 +3709,7 @@ setup_host_jit_symbols(llvm::orc::LLJIT & jit, const command_prog_t * prog)
 # endif /* CGIR_SUPPORT_LLVM */
 
 /* ---------------------------------------------------------------------------
- * Device aliasing (CGIR_NOALIAS, see noalias-llvmir.hpp) for a JIT'd kernel:
+ * Device aliasing (see noalias-llvmir.hpp) for a JIT'd kernel:
  * which of its pointer parameters get `noalias`. That attribute is what lets
  * NVPTX use the read-only data path (`ld.global.nc`) for a parameter the kernel
  * only reads, and what lets the optimizer reorder accesses across them.
@@ -3878,29 +3816,14 @@ device_arg_schema_key(uint64_t key)
 
 /* The instance values (`device_instance_t::values`: the key of everything derived
  * from them) of `prog` for an entry of schema `s`; with `raws`, also each known
- * parameter and its value as the analyses see it (canonical under trusted). The
+ * parameter and its value as the analyses see it. The
  * one encoding of those bytes, for the parsed and the parse-free paths alike. */
 static std::string
 device_instance_values(const device_arg_schema_t & s, const command_prog_t * prog,
                        std::vector<std::pair<unsigned, uint64_t>> * raws)
 {
-    /* CGIR_NOALIAS=trusted: a pointer is known by which others it equals, not
-     * by its value (see noalias::canonical_pointers) -- in the analyses and in
-     * `values`, the key of everything derived from them. */
-    const bool canon = noalias::canonical_pointers();
-    std::vector<uint64_t> seen;
-    auto canonical = [&] (uint64_t raw) -> uint64_t {
-        if (raw == 0)
-            return 0;
-        for (size_t k = 0 ; k < seen.size() ; ++k)
-            if (seen[k] == raw)
-                return noalias::canonical_address((unsigned) k);
-        seen.push_back(raw);
-        return noalias::canonical_address((unsigned) (seen.size() - 1));
-    };
-    /* Otherwise (prove, distinct-base) a user-space pointer (pointer_keyed_relative)
-     * is keyed by its offset from the
-     * lowest pointer of the instance, plus that pointer's low 16 bits. What the
+    /* A user-space pointer (pointer_keyed_relative) is keyed by its offset from
+     * the lowest pointer of the instance, plus that pointer's low 16 bits. What the
      * analyses decide depends on how the accessed byte ranges compare, i.e. on
      * the pointers' differences, which moving every pointer by one amount keeps
      * (and on alignment, which the low bits keep, up to 64 KiB). The keyed form
@@ -3910,19 +3833,17 @@ device_instance_values(const device_arg_schema_t & s, const command_prog_t * pro
      * instance missed. Pointers that move by different amounts change the
      * differences, and only miss. The analyses still see the real values. */
     uint64_t ref = 0;
-    if (!canon)
-        for (unsigned i = 0 ; i < (unsigned) s.kind.size() ; ++i)
-        {
-            if (prog->args == nullptr || i >= prog->n_args || prog->args[i] == nullptr ||
-                s.kind[i] != device_arg_schema_t::PTR || s.env[i])
-                continue ;
-            uint64_t raw = 0;
-            memcpy(&raw, prog->args[i], sizeof(void *));
-            if (pointer_keyed_relative(raw) && (ref == 0 || raw < ref))
-                ref = raw;
-        }
+    for (unsigned i = 0 ; i < (unsigned) s.kind.size() ; ++i)
+    {
+        if (prog->args == nullptr || i >= prog->n_args || prog->args[i] == nullptr ||
+            s.kind[i] != device_arg_schema_t::PTR || s.env[i])
+            continue ;
+        uint64_t raw = 0;
+        memcpy(&raw, prog->args[i], sizeof(void *));
+        if (pointer_keyed_relative(raw) && (ref == 0 || raw < ref))
+            ref = raw;
+    }
     std::string values;
-    if (!canon)
     {
         const uint64_t low = ref & 0xFFFFu;
         values.append("R", 1);
@@ -3936,14 +3857,12 @@ device_instance_values(const device_arg_schema_t & s, const command_prog_t * pro
         const size_t bytes = ptr ? sizeof(void *) : ((size_t) s.kind[i] + 7) / 8;
         uint64_t raw = 0;
         memcpy(&raw, prog->args[i], bytes);
-        if (ptr && canon)
-            raw = canonical(raw);
         /* An OpenMP launch environment is runtime scratch: no analysis reads its
          * value (it is in env.runtime_envs, not a base) and no code depends on
          * it, so it is keyed as present, not by its address -- which moves from
          * run to run (it is host memory under ASLR) and would otherwise make
          * every derived fact of a program a miss in the next run. */
-        const uint64_t kraw = s.env[i] ? 0 : (ptr && !canon && pointer_keyed_relative(raw)) ? raw - ref : raw;
+        const uint64_t kraw = s.env[i] ? 0 : (ptr && pointer_keyed_relative(raw)) ? raw - ref : raw;
         values.append(reinterpret_cast<const char *>(&i), sizeof(i));
         values.append(reinterpret_cast<const char *>(&kraw), sizeof(kraw));
         if (raws)
@@ -3994,28 +3913,9 @@ device_instance(llvm::Function & entry, const command_prog_t * prog,
     return d;
 }
 
-/* CGIR_NOALIAS=distinct-base: every pointer parameter whose value no other
- * pointer parameter shares. */
-static std::vector<bool>
-device_noalias_distinct(const device_instance_t & d, size_t nparams)
-{
-    std::vector<bool> set(nparams, false);
-    for (size_t i = 0 ; i < d.bases.size() ; ++i)
-    {
-        bool unique = (d.bases[i].addr != 0);
-        for (size_t j = 0 ; unique && j < d.bases.size() ; ++j)
-            if (j != i && d.bases[j].addr == d.bases[i].addr)
-                unique = false;
-        if (unique)
-            set[d.base_arg[i]] = true;
-    }
-    return set;
-}
-
 /* Every pointer parameter the analysis of `entry` -- a kernel in its final,
  * optimized form -- proves non-conflicting with everything else the kernel
- * accesses. Under CGIR_NOALIAS_VERIFY, also checks the distinct-base set
- * `assumed` (if any) against the same analysis. */
+ * accesses. */
 /* Forward the OpenMP device runtime's block broadcasts, for the analysis only:
  *
  *       if (tid.x == 0) G = C;      // G a shared-memory global, C a constant
@@ -4230,8 +4130,7 @@ device_specialize_for_analysis(llvm::Function & entry, const command_prog_t * pr
 
 static std::vector<bool>
 device_noalias_proven(llvm::Function & entry, const command_prog_t * prog,
-                      const std::vector<bool> * assumed, const env_params_t & env_params,
-                      llvm::TargetMachine * TM)
+                      const env_params_t & env_params, llvm::TargetMachine * TM)
 {
     std::unique_ptr<llvm::Module> C = device_specialize_for_analysis(entry, prog, env_params, TM);
     llvm::Function & SF = *C->getFunction(entry.getName());
@@ -4239,7 +4138,6 @@ device_noalias_proven(llvm::Function & entry, const command_prog_t * prog,
     const noalias::result_t r = noalias::analyze(SF, d.bases, d.env);
 
     std::vector<bool> set(entry.arg_size(), false);
-    unsigned proven = 0, candidates = 0;
 
     /* CGIR_NOALIAS_DEBUG=1: what the analysis saw, per pointer parameter */
     static const bool debug = env_flag("CGIR_NOALIAS_DEBUG");
@@ -4266,33 +4164,13 @@ device_noalias_proven(llvm::Function & entry, const command_prog_t * prog,
         const noalias::footprint_t & fi = r.base[i];
         if (!fi.accessed())
             continue ;
-        ++candidates;
         bool ok = !noalias::may_conflict(fi, d.bases[i].addr, r.unknown, 0);
         for (size_t j = 0 ; ok && j < d.bases.size() ; ++j)
             if (j != i && noalias::may_conflict(fi, d.bases[i].addr, r.base[j], d.bases[j].addr))
                 ok = false;
         if (ok)
-        {
             set[d.base_arg[i]] = true;
-            ++proven;
-        }
-
-        if (assumed && (*assumed)[d.base_arg[i]])
-        {
-            const std::string kname = entry.getName().str();
-            for (size_t j = 0 ; j < d.bases.size() ; ++j)
-                if (j != i && (j > i || !(*assumed)[d.base_arg[j]]))
-                    noalias::report_assumption(
-                        kname + " params " + std::to_string(d.base_arg[i]) +
-                        "," + std::to_string(d.base_arg[j]),
-                        fi, d.bases[i].addr, r.base[j], d.bases[j].addr);
-            noalias::report_assumption(
-                kname + " param " + std::to_string(d.base_arg[i]) + " vs unattributed accesses",
-                fi, d.bases[i].addr, r.unknown, 0);
-        }
     }
-    if (!assumed)
-        noalias::report_proven(proven, candidates);
     return set;
 }
 
@@ -4675,7 +4553,7 @@ bitset_bytes(const std::vector<bool> & set)
     return s;
 }
 
-/* CGIR_NOALIAS=prove, warm: the PTX of an instance whose analysis an earlier
+/* Warm: the PTX of an instance whose analysis an earlier
  * instance -- or an earlier run, through the on-disk store -- recorded under the
  * same instance values (`values`, see device_instance_values). The derived facts
  * are "bits|plan|indep"; the artifact key is the one the jit pass builds
@@ -4723,7 +4601,7 @@ device_settle_residency(command_prog_t * prog, const std::string & plan)
 
 /* A device kernel in its final, optimized form, before any noalias of ours was
  * added, kept per program (cache_key) for the process lifetime: under
- * CGIR_NOALIAS=prove (and to verify distinct-base) every instance is analysed
+ * every instance is analysed
  * against it, and the PTX is then emitted once per distinct noalias set rather
  * than re-optimized per instance. */
 struct device_optimized_t
@@ -4798,17 +4676,6 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     /* Fast path (pre-parse): reuse a cached artifact directly. Device PTX (from
      * this process or a prior run on disk); host compiled function pointer (this
      * process only -- disk objects are loaded further down, needing the entry). */
-    if (is_device && noalias::mode() == noalias::MODE_NONE && !prog->requires_coresident_grid)
-    {
-        std::string ptx;
-        if (const int hit = cache_device_get(key, ptx))
-        {
-            restore_device_ptx(prog, ptx);
-            if (profiling_stats_on()) profiling_cache_event(true, hit == 1 ? 1 : 2);
-            return ;
-        }
-    }
-    else
     {
         int    proto_hit = 0;
         void * fn_hit     = nullptr;
@@ -4828,14 +4695,14 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
     const bool  dump     = dump_enabled("CGIR_JIT_DUMP");
     std::string dump_dir = dump ? dump_make_dir("CGIR_JIT_DUMP", "jit") : std::string();
 
-    /* CGIR_NOALIAS=prove (the default), warm: an instance of a program already
+    /* Warm: an instance of a program already
      * analysed -- earlier in this run, or in an earlier one through the on-disk
      * store -- finds its artifact from its argument values alone, given the
      * program's argument schema (device_arg_schema_t), without parsing the IR.
      * Exactly the lookup the prove path below makes after parsing; any miss
      * falls through to it. Not while dumping or verifying, which want the
      * parsed module. */
-    if (is_device && !dump && noalias::mode() == noalias::MODE_PROVE && !noalias::verify())
+    if (is_device && !dump)
     {
         std::string         sb;
         device_arg_schema_t sch;
@@ -4957,7 +4824,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
                         entry->getName().str().c_str(), prog->blocks_per_sm);
         }
 
-        /* Which pointer parameters get `noalias` (CGIR_NOALIAS): the one place
+        /* Which pointer parameters get `noalias`: the one place
          * the device JIT can beat the ahead-of-time toolchain on aliasing.
          * NVPTX lowers a load through a kernel parameter to `ld.global.nc` (the
          * read-only data path) only when the parameter is BOTH readonly and
@@ -4966,19 +4833,14 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
          * to be distinct objects. A runtime that knows the values a recorded
          * kernel is replayed with does not have to give up:
          *
-         *   prove          analyse the kernel in its final form (only there
-         *                  are all its accesses visible: before the post-link
-         *                  O3 an outlined parallel region reaches its data
-         *                  through an args array) against this instance's
-         *                  values. The optimized module is kept per program and
-         *                  PTX is emitted per distinct proven set.
-         *   distinct-base  pointer parameters with distinct values are
-         *                  assumed disjoint; marked before the pipeline.
-         *   none           nothing.
-         *
-         * Either way the result depends on argument values, which the content
-         * key does not cover, so the artifact is keyed by key + the set. */
-        const noalias::policy_t nam      = noalias::mode();
+         * it analyses the kernel in its final form (only there are all its
+         * accesses visible: before the post-link O3 an outlined parallel
+         * region reaches its data through an args array) against this
+         * instance's values, and marks what it proves (noalias-llvmir.hpp).
+         * The optimized module is kept per program and PTX is emitted per
+         * distinct proven set. The result depends on argument values, which
+         * the content key does not cover, so the artifact is keyed by key +
+         * the set. */
         const char *          dtriple  = prog->source.content.llvmir.triple;
         const char *          darch    = prog->source.content.llvmir.arch;
         const char * const *  dlibs    = prog->source.content.llvmir.device_libs;
@@ -5066,7 +4928,6 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             return it == device_optimized.end() ? nullptr : &it->second;
         };
 
-        if (nam == noalias::MODE_PROVE)
         {
             /* A warm run knows this instance's set without the analysis. */
             const device_instance_t inst = device_instance(*entry, prog);
@@ -5108,7 +4969,7 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             {
                 command_prog_t alt = *prog;
                 alt.grid.x = g;
-                const std::vector<bool> s2 = device_noalias_proven(*oentry, &alt, nullptr,
+                const std::vector<bool> s2 = device_noalias_proven(*oentry, &alt,
                                                                    O->env_params, TM.get());
                 if (set.empty()) set = s2;
                 for (size_t i = 0 ; i < set.size() && i < s2.size() ; ++i)
@@ -5177,132 +5038,6 @@ CGIR_NAMESPACE::command_graph_jit_llvmir(
             finish(ptx, 0);
             return ;
         }
-
-        /* none / distinct-base / trusted: one pipeline, attributes (if any) up front */
-        std::vector<bool> set(entry->arg_size(), false);
-        /* trusted: what a fused kernel's plan and thread independence depend on
-         * is in `values` (pointer equality, scalars, launch), so a warm run --
-         * a later instance, or a later run with the on-disk cache -- reads them
-         * back instead of optimizing twice to rederive them */
-        uint64_t tkey = 0;
-        if (nam == noalias::MODE_TRUSTED && fused_markers && noalias::canonical_pointers())
-        {
-            const device_instance_t inst = device_instance(*entry, prog);
-            const std::string v = "trusted|" + inst.values;
-            tkey = cache_key_extend(key, v.data(), v.size());
-            std::string meta;
-            if (cache_meta_get(tkey, meta))
-            {
-                /* "plan|indep" */
-                const size_t b1 = meta.find('|');
-                plan  = meta.substr(0, b1);
-                indep = (b1 == std::string::npos) ? std::string() : meta.substr(b1 + 1);
-                spec  = inst.values;   /* specialize_for_launch's, as below */
-                std::string ptx;
-                if (const int hit = cache_device_get(set_key(device_noalias_distinct(inst, entry->arg_size())), ptx))
-                {
-                    settle_residency();
-                    finish(ptx, hit == 1 ? 1 : 2);
-                    return ;
-                }
-                plan.clear();
-                indep.clear();
-                spec.clear();
-            }
-        }
-        if (noalias::assume_distinct())
-        {
-            const device_instance_t inst = device_instance(*entry, prog);
-            set = device_noalias_distinct(inst, entry->arg_size());
-
-            /* Verification analyses the kernel without the assumption: its own
-             * optimized copy, made once per program. */
-            if (noalias::verify())
-            {
-                device_optimized_t * O = lookup_optimized();
-                if (O == nullptr)
-                {
-                    auto C = std::make_unique<llvm::LLVMContext>();
-                    llvm::SmallString<0> bc;
-                    {
-                        llvm::raw_svector_ostream os(bc);
-                        llvm::WriteBitcodeToFile(*mod, os);
-                    }
-                    auto M = llvm::parseBitcodeFile(
-                        llvm::MemoryBufferRef(llvm::StringRef(bc.data(), bc.size()), "verify"), *C);
-                    if (!M) fail("verify", llvm::toString(M.takeError()));
-                    O = &keep_optimized(std::move(C), std::move(*M));
-                }
-                if (llvm::Function * oentry = O->mod->getFunction(O->entry))
-                {
-                    std::string err;
-                    auto TM = make_device_tm(dtriple, darch, O->features, err);
-                    if (!TM) fail("target", err);
-                    device_noalias_proven(*oentry, prog, &set, O->env_params, TM.get());
-                }
-            }
-
-            if (add_noalias_params(*entry, set) && dump)
-                fprintf(stderr, "jit(device): assuming the distinct pointer parameters of "
-                                "`%s` do not alias\n", entry_name.c_str());
-        }
-        /* A fused kernel's barrier plan needs its final form: optimize first,
-         * then look the artifact up (only code generation is saved). */
-        std::string err;
-        std::unique_ptr<llvm::TargetMachine> TM;
-        auto optimize = [&] () {
-            const std::string features = device_features_of(*mod);
-            TM = make_device_tm(dtriple, darch, features, err);
-            if (!TM) fail("target", err);
-            if (!optimize_device_module(*mod, TM.get(), dblibs, dnblibs, dlibs, dnlibs,
-                                        dump ? dump_dir : std::string(), err))
-                fail("optimize", err);
-        };
-        if (fused_markers)
-        {
-            /* plan on an optimized copy, then lower the markers of the real
-             * module BEFORE optimizing it (see the prove path) */
-            const size_t nmarkers = tag_grid_barrier_markers(*entry);
-            std::unique_ptr<llvm::Module> A = llvm::CloneModule(*mod);
-            llvm::Function * aentry = A->getFunction(entry_name);
-            const std::string features = device_features_of(*A);
-            TM = make_device_tm(dtriple, darch, features, err);
-            if (!TM) fail("target", err);
-            if (!optimize_device_module(*A, TM.get(), dblibs, dnblibs, dlibs, dnlibs, std::string(), err))
-                fail("optimize", err);
-            check_markers_survived(*aentry, nmarkers);
-            plan = device_barrier_plan(*aentry, prog, device_runtime_env_params(*aentry), TM.get());
-            settle_residency();
-            lower_grid_barrier_markers(*entry, plan);
-            spec = specialize_for_launch(*entry, prog, device_runtime_env_params(*entry));
-            optimize();
-            specialize_grid(*entry, prog);
-            if (plan.find('2') == std::string::npos &&
-                device_thread_independent(*entry, prog, device_runtime_env_params(*entry), TM.get()))
-            {
-                indep = "T";
-                strip_block_barriers_and_merge(*mod, *entry, TM.get());
-            }
-        }
-        if (tkey)
-            cache_meta_put(tkey, plan + "|" + indep);
-        const uint64_t skey = (nam == noalias::MODE_NONE && plan.empty()) ? key : set_key(set);
-        {
-            std::string ptx;
-            if (const int hit = cache_device_get(skey, ptx))
-            {
-                finish(ptx, hit == 1 ? 1 : 2);
-                return ;
-            }
-        }
-
-        if (!fused_markers)
-            optimize();
-        std::string ptx = codegen_device_ptx(*mod, TM.get(), err);
-        if (ptx.empty()) fail("PTX emission failed", err);
-        cache_device_put(skey, ptx);
-        finish(ptx, 0);
-        return ;
     }
 
 
